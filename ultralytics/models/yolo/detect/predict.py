@@ -63,6 +63,7 @@ class DetectionPredictor(BasePredictor):
             end2end=getattr(self.model, "end2end", False),
             rotated=self.args.task == "obb",
             return_idxs=save_feats,
+            multi_label=True
         )
 
         if not isinstance(orig_imgs, list):  # input images are a torch.Tensor, not a list

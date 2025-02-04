@@ -144,15 +144,26 @@ class DetectionValidator(BaseValidator):
             (dict): Prepared batch with processed annotations.
         """
         idx = batch["batch_idx"] == si
-        cls = batch["cls"][idx].squeeze(-1)
+        cls = batch["cls"][idx]
         bbox = batch["bboxes"][idx]
+
+        # multi-label: replicate/expand GT keypoints
+        rows, cols = torch.where(cls == 1)
+        num_classes = cls.size(1)
+        new_cls = torch.zeros((len(rows), num_classes), dtype=torch.int)
+        new_cls[torch.arange(len(rows)), cols] = 1
+        # Replicate the box tensor correspondingly
+        new_bbox = bbox[rows]
+        cls=new_cls.to(self.device)
+        bbox=new_bbox.to(self.device)
+
         ori_shape = batch["ori_shape"][si]
         imgsz = batch["img"].shape[2:]
         ratio_pad = batch["ratio_pad"][si]
         if len(cls):
             bbox = ops.xywh2xyxy(bbox) * torch.tensor(imgsz, device=self.device)[[1, 0, 1, 0]]  # target boxes
             ops.scale_boxes(imgsz, bbox, ori_shape, ratio_pad=ratio_pad)  # native-space labels
-        return {"cls": cls, "bbox": bbox, "ori_shape": ori_shape, "imgsz": imgsz, "ratio_pad": ratio_pad}
+        return {"cls": cls, "bbox": bbox, "ori_shape": ori_shape, "imgsz": imgsz, "ratio_pad": ratio_pad, "rows":rows}
 
     def _prepare_pred(self, pred, pbatch):
         """
@@ -191,7 +202,7 @@ class DetectionValidator(BaseValidator):
             cls, bbox = pbatch.pop("cls"), pbatch.pop("bbox")
             nl = len(cls)
             stat["target_cls"] = cls
-            stat["target_img"] = cls.unique()
+            stat["target_img"] = cls.nonzero()[:, 1].unique()
             if npr == 0:
                 if nl:
                     for k in self.stats.keys():
@@ -245,7 +256,7 @@ class DetectionValidator(BaseValidator):
             (dict): Dictionary containing metrics results.
         """
         stats = {k: torch.cat(v, 0).cpu().numpy() for k, v in self.stats.items()}  # to numpy
-        self.nt_per_class = np.bincount(stats["target_cls"].astype(int), minlength=self.nc)
+        self.nt_per_class = np.bincount(stats["target_cls"].nonzero()[1], minlength=self.nc)
         self.nt_per_image = np.bincount(stats["target_img"].astype(int), minlength=self.nc)
         stats.pop("target_img", None)
         if len(stats):
@@ -281,7 +292,7 @@ class DetectionValidator(BaseValidator):
                 (x1, y1, x2, y2, conf, class).
             gt_bboxes (torch.Tensor): Tensor of shape (M, 4) representing ground-truth bounding box coordinates. Each
                 bounding box is of the format: (x1, y1, x2, y2).
-            gt_cls (torch.Tensor): Tensor of shape (M,) representing target class indices.
+            gt_cls (torch.Tensor): Tensor of shape (M, nc) representing target class indices.
 
         Returns:
             (torch.Tensor): Correct prediction matrix of shape (N, 10) for 10 IoU levels.
@@ -328,7 +339,7 @@ class DetectionValidator(BaseValidator):
         plot_images(
             batch["img"],
             batch["batch_idx"],
-            batch["cls"].squeeze(-1),
+            batch["cls"],
             batch["bboxes"],
             paths=batch["im_file"],
             fname=self.save_dir / f"val_batch{ni}_labels.jpg",

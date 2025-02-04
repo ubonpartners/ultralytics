@@ -15,6 +15,11 @@ OKS_SIGMA = (
     / 10.0
 )
 
+# yolo-dpa : alternate OKS_SIGMA for when there are 5 facepoints + 17 pose points
+FACEPOSE_SIGMA = (
+    np.array([0.25, 0.25, 0.26, 0.25, 0.25, 0.26, 0.25, 0.25, 0.35, 0.35, 0.79, 0.79, 0.72, 0.72, 0.62, 0.62, 1.07, 1.07, 0.87, 0.87, 0.89, 0.89])
+    / 10.0
+)
 
 def bbox_ioa(box1, box2, iou=False, eps=1e-7):
     """
@@ -340,7 +345,7 @@ class ConfusionMatrix:
                                       Each row should contain (x1, y1, x2, y2, conf, class)
                                       or with an additional element `angle` when it's obb.
             gt_bboxes (Array[M, 4]| Array[N, 5]): Ground truth bounding boxes with xyxy/xyxyr format.
-            gt_cls (Array[M]): The class labels.
+            gt_cls (Array[M, nc]): The class labels.
         """
         if gt_cls.shape[0] == 0:  # Check if labels is empty
             if detections is not None:
@@ -352,7 +357,9 @@ class ConfusionMatrix:
         if detections is None:
             gt_classes = gt_cls.int()
             for gc in gt_classes:
-                self.matrix[self.nc, gc] += 1  # background FN
+                # For multilabel task
+                for g in np.nonzero(gc)[0]:
+                    self.matrix[self.nc, g] += 1  # background FN
             return
 
         detections = detections[detections[:, 4] > self.conf]
@@ -379,15 +386,16 @@ class ConfusionMatrix:
         n = matches.shape[0] > 0
         m0, m1, _ = matches.transpose().astype(int)
         for i, gc in enumerate(gt_classes):
-            j = m0 == i
-            if n and sum(j) == 1:
-                self.matrix[detection_classes[m1[j]], gc] += 1  # correct
-            else:
-                self.matrix[self.nc, gc] += 1  # true background
-
-        for i, dc in enumerate(detection_classes):
-            if not any(m1 == i):
-                self.matrix[dc, self.nc] += 1  # predicted background
+            for g in np.nonzero(gc)[0]:
+                j = m0 == i
+                if n and sum(j) == 1:
+                    self.matrix[detection_classes[m1[j]], g] += 1  # correct
+                else:
+                    self.matrix[self.nc, g] += 1  # true background
+        if n:
+            for i, dc in enumerate(detection_classes):
+                if not any(m1 == i):
+                    self.matrix[dc, self.nc] += 1  # predicted background
 
     def matrix(self):
         """Return the confusion matrix."""
@@ -606,12 +614,13 @@ def ap_per_class(
         x (np.ndarray): X-axis values for the curves.
         prec_values (np.ndarray): Precision values at mAP@0.5 for each class.
     """
+
     # Sort by objectness
     i = np.argsort(-conf)
     tp, conf, pred_cls = tp[i], conf[i], pred_cls[i]
 
     # Find unique classes
-    unique_classes, nt = np.unique(target_cls, return_counts=True)
+    unique_classes, nt = np.unique(target_cls.nonzero()[1], return_counts=True)
     nc = unique_classes.shape[0]  # number of classes, number of detections
 
     # Create Precision-Recall curve and compute AP for each class
