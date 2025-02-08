@@ -172,14 +172,15 @@ class v8DetectionLoss:
         m = model.model[-1]  # Detect() module
 
         # yolo-dpa : experiment weight the class loss for the non-attribute classes higher
-        weight = torch.ones(m.nc)  # Initialize with equal weights
-        weight[0] = 2.0
-        weight[1] = 2.0
-        weight[4] = 2.0
-
-        weight=weight.to(device)
-
-        self.bce = nn.BCEWithLogitsLoss(reduction="none", weight=weight)
+        if False:
+            weight = torch.ones(m.nc)  # Initialize with equal weights
+            weight[0] = 2.0
+            weight[1] = 2.0
+            weight[4] = 2.0
+            weight=weight.to(device)
+            self.bce = nn.BCEWithLogitsLoss(reduction="none", weight=weight)
+        else:
+            self.bce = nn.BCEWithLogitsLoss(reduction="none")
         self.hyp = h
         self.stride = m.stride  # model strides
         self.nc = m.nc  # number of classes
