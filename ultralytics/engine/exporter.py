@@ -67,9 +67,11 @@ from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
+from bisect import bisect_right
 
 import numpy as np
 import torch
+import re
 
 from ultralytics.cfg import TASK2DATA, get_cfg
 from ultralytics.data import build_dataloader
@@ -900,6 +902,91 @@ class Exporter:
         if not parser.parse_from_file(f_onnx):
             raise RuntimeError(f"failed to load ONNX file: {f_onnx}")
 
+        # code for selectively leaving some layers as FP16 during int8 quant
+        if False:
+            output_tensor_names = {network.get_output(i).name for i in range(network.num_outputs)}
+            conv_layers=[i for i in range(network.num_layers) if network.get_layer(i).type==trt.LayerType.CONVOLUTION]
+            output_layers=[]
+
+            for i in range(network.num_layers):
+                layer=network.get_layer(i)
+                if any(layer.get_output(j).name in output_tensor_names for j in range(layer.num_outputs)):
+                    output_layers.append(i)
+
+            output_conv_indexes = []
+            for val in output_layers:
+                index = bisect_right(conv_layers, val) - 1
+                output_conv_indexes.append(index)
+
+            print(f"output tensor names {output_tensor_names}")
+            print(f"conv layers {conv_layers}")
+            print(f"output layers {output_layers}")
+            print(f"output conv indexes {output_conv_indexes}")
+            print(f"output conv layers {[conv_layers[i] for i in output_conv_indexes]}")
+
+            # set of original model layers to leave as fp16
+            # parse layer name to get the original model layer this was derived from
+            # layers in yolo11 are named like /model.4/m.1/m/m.1/cv1/conv/Conv 
+            # so the .4 is the original layer in the yolo yaml file
+            # there are many layers/convolutions in the ONNX for each layer in the original model
+            # we specify a set of original layers to leave as fp16 and all ONNX layers that 
+            # correspond are set to fp16
+            # initial experiments seem to show the last layer 23, Detect(P3, P4, P5) is most important
+
+            # yolo11l-dpa-131224_int8_t7.engine  - 23
+            # yolo11l-dpa-131224_int8_t8.engine  - 0,1,13,16,19,22,23
+            # yolo11l-dpa-131224_int8_t9.engine  - 16,19,22,23
+            model_layers_half=[23]
+            halflayers=[]
+
+            for i in conv_layers:
+                layer=network.get_layer(i)
+                name=layer.name
+                match = re.search(r'model\.(\d+)', name)
+                model_layer=None
+                if match:
+                    model_layer=int(match.group(1))
+                if model_layer in model_layers_half:
+                    halflayers.append(i)
+                inp = layer.get_input(0)
+                outp = layer.get_output(0)
+                print(f"Conv {i:3d} l:{model_layer:2d} H {model_layer in model_layers_half} {layer.name:60s} {inp.shape}->{outp.shape}")
+
+            print(f"Setting layers {halflayers} to half")
+            for i in halflayers:
+                layer=network.get_layer(i)
+                if layer.type==trt.LayerType.CONVOLUTION:
+                    layer.precision = trt.DataType.HALF
+
+        if False:
+            print("\nTensorRT Network Layers (with Input/Output Precision):")
+            print("=" * 60)
+            for i in range(network.num_layers):
+                layer = network.get_layer(i)
+                print(f"Layer {i}: {layer.name} Type: {layer.type} Precision: {layer.precision}")
+
+                # Inputs with precision
+                input_details = []
+                for j in range(layer.num_inputs):
+                    inp = layer.get_input(j)
+                    if inp:
+                        input_details.append(f"{inp.name} dtype={inp.dtype} shape={inp.shape}")
+                    else:
+                        input_details.append("None")
+                print(f"  Inputs ({layer.num_inputs}): {input_details}")
+
+                # Outputs with precision
+                output_details = []
+                for j in range(layer.num_outputs):
+                    out = layer.get_output(j)
+                    if out:
+                        output_details.append(f"{out.name} dtype={out.dtype} shape={out.shape}")
+                    else:
+                        output_details.append("None")
+                print(f"  Outputs ({layer.num_outputs}): {output_details}")
+                print("-" * 60)
+
+
         # Network inputs
         inputs = [network.get_input(i) for i in range(network.num_inputs)]
         outputs = [network.get_output(i) for i in range(network.num_outputs)]
@@ -915,6 +1002,11 @@ class Exporter:
             profile = builder.create_optimization_profile()
             min_shape = (1, shape[1], 32, 32)  # minimum input shape
             max_shape = (*shape[:2], *(int(max(1, self.args.workspace or 1) * d) for d in shape[2:]))  # max input shape
+
+            print(f"(MDB:) tensorrt export max_shape {max_shape} workspace {workspace}")
+            if max_shape[2]>1280:
+                print(f"(MDB:) fixing max shape")
+                max_shape=(max_shape[0], max_shape[1], 960, 960)
             for inp in inputs:
                 profile.set_shape(inp.name, min=min_shape, opt=shape, max=max_shape)
             config.add_optimization_profile(profile)
@@ -922,8 +1014,13 @@ class Exporter:
         LOGGER.info(f"{prefix} building {'INT8' if int8 else 'FP' + ('16' if half else '32')} engine as {f}")
         if int8:
             config.set_flag(trt.BuilderFlag.INT8)
+            config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
             config.set_calibration_profile(profile)
             config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
+
+            # MDB: Enable FP16 globally for mixed precision
+            if builder.platform_has_fast_fp16:
+                config.set_flag(trt.BuilderFlag.FP16)
 
             class EngineCalibrator(trt.IInt8Calibrator):
                 def __init__(
