@@ -60,6 +60,26 @@ def linear_assignment(cost_matrix: np.ndarray, thresh: float, use_lap: bool = Tr
 
     return matches, unmatched_a, unmatched_b
 
+from cython_bbox import bbox_overlaps as bbox_ious2
+
+def working_ious(atlbrs, btlbrs):
+    """
+    Compute cost based on IoU
+    :type atlbrs: list[tlbr] | np.ndarray
+    :type atlbrs: list[tlbr] | np.ndarray
+
+    :rtype ious np.ndarray
+    """
+    ious = np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float32)
+    if ious.size == 0:
+        return ious
+
+    ious = bbox_ious2(
+        np.ascontiguousarray(atlbrs, dtype=np.float64),
+        np.ascontiguousarray(btlbrs, dtype=np.float64)
+    )
+
+    return ious
 
 def iou_distance(atracks: list, btracks: list) -> np.ndarray:
     """
@@ -85,6 +105,13 @@ def iou_distance(atracks: list, btracks: list) -> np.ndarray:
         atlbrs = [track.xywha if track.angle is not None else track.xyxy for track in atracks]
         btlbrs = [track.xywha if track.angle is not None else track.xyxy for track in btracks]
 
+    if True:
+        _ious = working_ious(atlbrs, btlbrs)
+        cost_matrix = 1 - _ious
+
+        return cost_matrix
+
+    # MDB; weird; the below code doesnt seem to function
     ious = np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float32)
     if len(atlbrs) and len(btlbrs):
         if len(atlbrs[0]) == 5 and len(btlbrs[0]) == 5:
