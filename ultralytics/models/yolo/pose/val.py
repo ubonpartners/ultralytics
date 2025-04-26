@@ -8,7 +8,7 @@ import torch
 from ultralytics.models.yolo.detect import DetectionValidator
 from ultralytics.utils import LOGGER, ops
 from ultralytics.utils.checks import check_requirements
-from ultralytics.utils.metrics import OKS_SIGMA, FACEPOSE_SIGMA, PoseMetrics, box_iou, kpt_iou
+from ultralytics.utils.metrics import OKS_SIGMA, FACEPOSE_SIGMA, FACEPOSEBOX_SIGMA, PoseMetrics, box_iou, kpt_iou
 from ultralytics.utils.plotting import output_to_target, plot_images
 
 
@@ -110,11 +110,14 @@ class PoseValidator(DetectionValidator):
         self.kpt_shape = self.data["kpt_shape"]
         is_pose = self.kpt_shape == [17, 3]
         is_facepose = self.kpt_shape == [22, 3]
+        is_faceposebox = self.kpt_shape == [23, 3]
         nkpt = self.kpt_shape[0]
         if is_pose:
             self.sigma = OKS_SIGMA
         elif is_facepose:
             self.sigma = FACEPOSE_SIGMA
+        elif is_faceposebox:
+            self.sigma = FACEPOSEBOX_SIGMA
         else:
             self.sigma = np.ones(nkpt) / nkpt
         self.stats = dict(tp_p=[], tp=[], conf=[], pred_cls=[], target_cls=[], target_img=[])
@@ -141,7 +144,7 @@ class PoseValidator(DetectionValidator):
         kpts[..., 0] *= w
         kpts[..., 1] *= h
         kpts = ops.scale_coords(pbatch["imgsz"], kpts, pbatch["ori_shape"], ratio_pad=pbatch["ratio_pad"])
-        # multi-label - replicate/expand GT keypoints 
+        # multi-label - replicate/expand GT keypoints
         pbatch["kpts"] = kpts[pbatch["rows"]]
         return pbatch
 
