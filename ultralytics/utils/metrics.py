@@ -15,10 +15,14 @@ OKS_SIGMA = (
     / 10.0
 )
 
-# yolo-dpa : alternate OKS_SIGMA for when there are 5 facepoints + 17 pose points
+# yolo-dpa : alternate OKS_SIGMA for when there are 22=5 facepoints + 17 pose points
 FACEPOSE_SIGMA = (
     np.array([0.25, 0.25, 0.26, 0.25, 0.25, 0.26, 0.25, 0.25, 0.35, 0.35, 0.79, 0.79, 0.72, 0.72, 0.62, 0.62, 1.07, 1.07, 0.87, 0.87, 0.89, 0.89])
     / 10.0
+)
+# alternate OKS_SIGMA for when there are 23=17 pose points+2 additional face points + 4 face box points
+FACEPOSEBOX_SIGMA = (
+    np.array([0.26, 0.25, 0.25, 0.35, 0.35, 0.79, 0.79, 0.72, 0.72, 0.62, 0.62, 1.07, 1.07, 0.87, 0.87, 0.89, 0.89,0.25, 0.25, 0.9, 0.9, 0.9, 0.9])/ 10.0
 )
 
 def bbox_ioa(box1, box2, iou=False, eps=1e-7):

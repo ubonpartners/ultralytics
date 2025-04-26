@@ -470,11 +470,14 @@ class v8PoseLoss(v8DetectionLoss):
         self.bce_pose = nn.BCEWithLogitsLoss()
         is_pose = self.kpt_shape == [17, 3]
         is_facepose = self.kpt_shape == [22, 3]
+        is_faceposebox = self.kpt_shape == [23, 3]
         nkpt = self.kpt_shape[0]  # number of keypoints
         if is_pose:
             sigmas = torch.from_numpy(OKS_SIGMA).to(self.device)
         elif is_facepose:
             sigmas = torch.from_numpy(FACEPOSE_SIGMA).to(self.device)
+        elif is_faceposebox:
+            sigmas = torch.from_numpy(FACEPOSEBOX_SIGMA).to(self.device)
         else:
             sigmas = torch.ones(nkpt, device=self.device) / nkpt
 
