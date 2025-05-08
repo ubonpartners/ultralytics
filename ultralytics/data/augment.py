@@ -1832,6 +1832,95 @@ class CopyPaste(BaseMixTransform):
         labels1["instances"] = instances
         return labels1
 
+from albumentations.core.transforms_interface import ImageOnlyTransform
+
+class SimulateBT709YUV420Randomized(ImageOnlyTransform):
+    """
+    Albumentations transform that does:
+      BGR -> BT.709 YUV420 -> BGR
+    with optional random jitter on coefficients and chroma dims.
+    """
+    def __init__(
+        self,
+        always_apply: bool = False,
+        p: float = 1.0,
+        coeff_range: float = 0.05,
+        subsample_error_prob: float = 0.1,
+        subsample_error_range: int = 2,
+    ):
+        super().__init__(always_apply, p)
+        print("Init here!")
+        self.coeff_range = coeff_range
+        self.subsample_error_prob = subsample_error_prob
+        self.subsample_error_range = subsample_error_range
+        # base BT.709
+        self.Kr0, self.Kg0, self.Kb0 = 0.2126, 0.7152, 0.0722
+        self.inv0 = {
+            'u_scale': 2.12798,
+            'v_scale': 1.28033,
+            'g_u': -0.21482,
+            'g_v': -0.38059,
+        }
+        self.rng = np.random.default_rng()
+
+    def apply(self, img: np.ndarray, **params) -> np.ndarray:
+        # to float32 BGR
+        img_f = img.astype(np.float32)
+        B, G, R = cv2.split(img_f)
+
+        # jitter coeffs?
+        if self.p > 0 and self.rng.random() < self.p:
+            f = self.rng.uniform(1 - self.coeff_range,
+                                  1 + self.coeff_range, size=3)
+            Kr = self.Kr0 * f[0]
+            Kg = self.Kg0 * f[1]
+            Kb = self.Kb0 * f[2]
+            inv = {k: v * self.rng.uniform(1 - self.coeff_range,
+                                           1 + self.coeff_range)
+                   for k, v in self.inv0.items()}
+        else:
+            Kr, Kg, Kb = self.Kr0, self.Kg0, self.Kb0
+            inv = self.inv0
+
+        # 1) BGR->YUV
+        Y = Kr * R + Kg * G + Kb * B
+        U = (B - Y) * 0.5389 + 128.0
+        V = (R - Y) * 0.6350 + 128.0
+
+        # chroma dims
+        h, w = Y.shape
+        base_w, base_h = w // 2, h // 2
+        if self.rng.random() < self.subsample_error_prob:
+            dw = int(self.rng.integers(-self.subsample_error_range,
+                                       self.subsample_error_range + 1))
+            dh = int(self.rng.integers(-self.subsample_error_range,
+                                       self.subsample_error_range + 1))
+            sw = max(1, base_w + dw)
+            sh = max(1, base_h + dh)
+        else:
+            sw, sh = base_w, base_h
+
+        # 2) down & upsample U, V
+        U_ds = cv2.resize(U, (sw, sh), interpolation=cv2.INTER_AREA)
+        V_ds = cv2.resize(V, (sw, sh), interpolation=cv2.INTER_AREA)
+        U_us = cv2.resize(U_ds, (w, h), interpolation=cv2.INTER_LINEAR)
+        V_us = cv2.resize(V_ds, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        # 3) YUV->BGR
+        Um, Vm = U_us - 128.0, V_us - 128.0
+        Rr = Y + inv['v_scale'] * Vm
+        Bb = Y + inv['u_scale'] * Um
+        Gg = Y + inv['g_u'] * Um + inv['g_v'] * Vm
+
+        out = cv2.merge((
+            np.clip(Bb, 0, 255).astype(np.uint8),
+            np.clip(Gg, 0, 255).astype(np.uint8),
+            np.clip(Rr, 0, 255).astype(np.uint8),
+        ))
+        return out
+
+    def get_transform_init_args_names(self):
+        return ("coeff_range", "subsample_error_prob", "subsample_error_range")
 
 class Albumentations:
     """
@@ -1893,6 +1982,9 @@ class Albumentations:
         self.p = p
         self.transform = None
         prefix = colorstr("albumentations: ")
+
+        self.yuv = SimulateBT709YUV420Randomized(p=1.0)
+        self.yuv_p=0.4
 
         try:
             import os
@@ -2010,6 +2102,7 @@ class Albumentations:
             - Spatial transforms update bounding boxes, while non-spatial transforms only modify the image.
             - Requires the Albumentations library to be installed.
         """
+
         if self.transform is None or random.random() > self.p:
             return labels
 
@@ -2032,6 +2125,9 @@ class Albumentations:
                 labels["instances"].update(bboxes=bboxes)
         else:
             labels["img"] = self.transform(image=labels["img"])["image"]  # transformed
+
+        if random.random() < self.yuv_p:
+            labels["img"] = self.yuv.apply(labels["img"])
 
         return labels
 
