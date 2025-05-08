@@ -1901,10 +1901,15 @@ class SimulateBT709YUV420Randomized(ImageOnlyTransform):
             sw, sh = base_w, base_h
 
         # 2) down & upsample U, V
+
+        interp_mode=cv2.INTER_NEAREST
+        if self.rng.random() < 0.5:
+            interp_mode=cv2.INTER_LINEAR
+
         U_ds = cv2.resize(U, (sw, sh), interpolation=cv2.INTER_AREA)
         V_ds = cv2.resize(V, (sw, sh), interpolation=cv2.INTER_AREA)
-        U_us = cv2.resize(U_ds, (w, h), interpolation=cv2.INTER_LINEAR)
-        V_us = cv2.resize(V_ds, (w, h), interpolation=cv2.INTER_LINEAR)
+        U_us = cv2.resize(U_ds, (w, h), interpolation=interp_mode)
+        V_us = cv2.resize(V_ds, (w, h), interpolation=interp_mode)
 
         # 3) YUV->BGR
         Um, Vm = U_us - 128.0, V_us - 128.0
