@@ -1849,7 +1849,6 @@ class SimulateBT709YUV420Randomized(ImageOnlyTransform):
         subsample_error_range: int = 2,
     ):
         super().__init__(always_apply, p)
-        print("Init here!")
         self.coeff_range = coeff_range
         self.subsample_error_prob = subsample_error_prob
         self.subsample_error_range = subsample_error_range
@@ -1989,7 +1988,7 @@ class Albumentations:
         prefix = colorstr("albumentations: ")
 
         self.yuv = SimulateBT709YUV420Randomized(p=1.0)
-        self.yuv_p=0.4
+        self.yuv_p=0.05
 
         try:
             import os
