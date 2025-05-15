@@ -312,7 +312,7 @@ class Results(SimpleClass):
             if v is not None:
                 return len(v)
 
-    def update(self, boxes=None, masks=None, probs=None, obb=None, keypoints=None):
+    def update(self, boxes=None, masks=None, probs=None, obb=None, keypoints=None, reid_embeddings=None):
         """
         Updates the Results object with new detection data.
 
@@ -342,6 +342,8 @@ class Results(SimpleClass):
             self.obb = OBB(obb, self.orig_shape)
         if keypoints is not None:
             self.keypoints = Keypoints(keypoints, self.orig_shape)
+        if reid_embeddings is not None:
+            self.reid_embeddings=reid_embeddings
 
     def _apply(self, fn, *args, **kwargs):
         """

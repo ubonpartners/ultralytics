@@ -1,7 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-from .predict import PosePredictor
+from .predict import PosePredictor, PoseReIDPredictor
 from .train import PoseTrainer
 from .val import PoseValidator
 
-__all__ = "PoseTrainer", "PoseValidator", "PosePredictor"
+__all__ = "PoseTrainer", "PoseValidator", "PosePredictor", "PoseReIDPredictor"

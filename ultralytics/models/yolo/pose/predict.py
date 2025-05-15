@@ -77,3 +77,22 @@ class PosePredictor(DetectionPredictor):
         pred_kpts = ops.scale_coords(img.shape[2:], pred_kpts, orig_img.shape)
         result.update(keypoints=pred_kpts)
         return result
+
+class PoseReIDPredictor(PosePredictor):
+    """Predictor that knows PoseReID returns a 192-d embedding."""
+
+    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
+        super().__init__(cfg, overrides, _callbacks)
+        self.args.task = "pose_reid"
+
+    def construct_result(self, pred, img, orig_img, img_path):
+        # pred is [B, C, A], e.g. [1, 110 + 192, 8400]
+        if pred.numel():
+            reid_emb = pred[:, -192:]           # [B, 192, A]
+            pred = pred[:, :-192]               # [B, C-192, A]
+        else:
+            reid_emb = None
+        result = super().construct_result(pred, img, orig_img, img_path)
+        if reid_emb is not None:
+            result.update(reid_embeddings=reid_emb)
+        return result

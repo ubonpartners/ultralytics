@@ -52,6 +52,7 @@ class DetectionPredictor(BasePredictor):
             >>> processed_results = predictor.postprocess(preds, img, orig_imgs)
         """
         save_feats = getattr(self, "save_feats", False)
+        expanded_feats = getattr(self, "expanded_feats", False)
         preds = ops.non_max_suppression(
             preds,
             self.args.conf,
@@ -70,7 +71,7 @@ class DetectionPredictor(BasePredictor):
             orig_imgs = ops.convert_torch2numpy_batch(orig_imgs)
 
         if save_feats:
-            obj_feats = self.get_obj_feats(self._feats, preds[1])
+            obj_feats = self.get_obj_feats(self._feats, preds[1], expanded_feats=expanded_feats)
             preds = preds[0]
 
         results = self.construct_results(preds, img, orig_imgs, **kwargs)
@@ -81,8 +82,7 @@ class DetectionPredictor(BasePredictor):
 
         return results
 
-    def get_obj_feats(self, feat_maps, idxs):
-        """Extract object features from the feature maps."""
+    """def get_obj_feats(self, feat_maps, idxs, expanded_feats=False):
         import torch
 
         s = min([x.shape[1] for x in feat_maps])  # find smallest vector length
@@ -90,6 +90,62 @@ class DetectionPredictor(BasePredictor):
             [x.permute(0, 2, 3, 1).reshape(x.shape[0], -1, s, x.shape[1] // s).mean(dim=-1) for x in feat_maps], dim=1
         )  # mean reduce all vectors to same length
         return [feats[idx] if len(idx) else [] for feats, idx in zip(obj_feats, idxs)]  # for each img in batch
+    """
+
+    def get_obj_feats(self, feat_maps, idxs, expanded_feats=False):
+        """
+        feat_maps: list of 3 (or N) tensors [B, C_i, H_i, W_i]
+        idxs:      list of index lists per image
+        expanded_feats: if True, output [B, total_anchors, D+C] where
+                        D = max_i(C_i) and C = number of scales
+        """
+        import torch
+
+        if not expanded_feats:
+            # original “min‐reduce” path
+            s = min(x.shape[1] for x in feat_maps)
+            obj = torch.cat([
+                x.permute(0,2,3,1)
+                .reshape(x.shape[0], -1, s, x.shape[1] // s)
+                .mean(dim=-1)
+                for x in feat_maps
+            ], dim=1)
+            return [ feats[i] if len(i) else [] for feats,i in zip(obj, idxs) ]
+
+        # --- expanded path with fully dynamic dims ---
+        # 1) figure out the “wide” dimension = the largest channel size among inputs
+        target_dim = max(x.shape[1] for x in feat_maps)
+        # 2) one-hot size = number of scales
+        num_scales = max(8, len(feat_maps))
+
+        all_scales = []
+        for scale_idx, x in enumerate(feat_maps):
+            B, C, H, W = x.shape
+            N = H * W
+            # flatten spatial → [B, N, C]
+            flat = x.permute(0,2,3,1).reshape(B, N, C)
+
+            # pad up to target_dim
+            if C < target_dim:
+                pad = flat.new_zeros(B, N, target_dim - C)
+                feat_wide = torch.cat([flat, pad], dim=2)
+            else:
+                feat_wide = flat
+
+            # build a dynamic one-hot of length=num_scales
+            one_hot = flat.new_zeros(B, N, num_scales)
+            one_hot[:, :, scale_idx] = 1.0
+
+            # concat → [B, N, target_dim + num_scales]
+            all_scales.append(torch.cat([feat_wide, one_hot], dim=2))
+
+        # stack all scales → [B, total_anchors, target_dim + num_scales]
+        obj = torch.cat(all_scales, dim=1)
+        # pick out only the requested indices per image
+        return [
+            feats[i] if len(i) else []
+            for feats, i in zip(obj, idxs)
+        ]
 
     def construct_results(self, preds, img, orig_imgs):
         """
