@@ -468,6 +468,7 @@ class v8PoseLoss(v8DetectionLoss):
         super().__init__(model)
         self.kpt_shape = model.model[-1].kpt_shape
         self.bce_pose = nn.BCEWithLogitsLoss()
+        self.nc_main = 5
         is_pose = self.kpt_shape == [17, 3]
         is_facepose = self.kpt_shape == [22, 3]
         is_faceposebox = self.kpt_shape == [23, 3]
@@ -485,7 +486,7 @@ class v8PoseLoss(v8DetectionLoss):
 
     def __call__(self, preds, batch):
         """Calculate the total loss and detach it for pose estimation."""
-        loss = torch.zeros(5, device=self.device)  # box, cls, dfl, kpt_location, kpt_visibility
+        loss = torch.zeros(6, device=self.device)  # box, cls, dfl, kpt_location, kpt_visibility
         feats, pred_kpts = preds if isinstance(preds[0], list) else preds[1]
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * 4, self.nc), 1
@@ -525,8 +526,30 @@ class v8PoseLoss(v8DetectionLoss):
 
         # Cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[3] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        #loss[3] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        #loss[5] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
 
+        # 1. Flatten to (N, nc)
+        pred = pred_scores.view(-1, self.nc)
+        tgt  = target_scores.view(-1, self.nc)
+
+        # 2. Split proper vs. attribute classes
+        pred_main = pred[:, :self.nc_main]      # (N, 5)
+        tgt_main  = tgt[:, :self.nc_main]
+        pred_attr = pred[:, self.nc_main:]      # (N, nc-5)
+        tgt_attr  = tgt[:, self.nc_main:]
+
+        # 3. Compute per-group BCE (no reduction)
+        loss_main_terms = self.bce(pred_main, tgt_main)  # shape (N,5)
+        loss_attr_terms = self.bce(pred_attr, tgt_attr)  # shape (N,nc-5)
+
+        # 4. Normalize each by its own positive count
+        #    (clamp to 1 to avoid divide-zero if a batch has no positives of that group)
+        pos_main = tgt_main.sum().clamp(min=1)
+        pos_attr = tgt_attr.sum().clamp(min=1)
+
+        loss[3] = loss_main_terms[tgt_main.bool()].sum() / pos_main  # main classes
+        loss[5] = 0.5*loss_attr_terms[tgt_attr.bool()].sum() / pos_attr  # attr
 
         # Bbox loss
         if fg_mask.sum():
@@ -547,6 +570,7 @@ class v8PoseLoss(v8DetectionLoss):
         loss[2] *= self.hyp.kobj  # kobj gain
         loss[3] *= self.hyp.cls  # cls gain
         loss[4] *= self.hyp.dfl  # dfl gain
+        loss[5] *= self.hyp.cls  # cls gain
 
         return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
 
