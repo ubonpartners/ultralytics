@@ -308,6 +308,7 @@ class ReIDAdapter(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(self.feat_dim, hidden),
             nn.ReLU(),
+            nn.Dropout(0.3),
             nn.Linear(hidden, emb),
             nn.LayerNorm(emb)
         )
