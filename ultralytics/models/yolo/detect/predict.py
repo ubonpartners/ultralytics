@@ -71,7 +71,7 @@ class DetectionPredictor(BasePredictor):
             orig_imgs = ops.convert_torch2numpy_batch(orig_imgs)
 
         if save_feats:
-            obj_feats = self.get_obj_feats(self._feats, preds[1], expanded_feats=expanded_feats)
+            obj_feats = self.get_obj_feats(self._feats,self._feats2, preds[1], expanded_feats=expanded_feats)
             preds = preds[0]
 
         results = self.construct_results(preds, img, orig_imgs, **kwargs)
@@ -92,7 +92,7 @@ class DetectionPredictor(BasePredictor):
         return [feats[idx] if len(idx) else [] for feats, idx in zip(obj_feats, idxs)]  # for each img in batch
     """
 
-    def get_obj_feats(self, feat_maps, idxs, expanded_feats=False):
+    def get_obj_feats(self, feat_maps,feat_maps2, idxs, expanded_feats=False):
         """
         feat_maps: list of 3 (or N) tensors [B, C_i, H_i, W_i]
         idxs:      list of index lists per image
@@ -100,6 +100,10 @@ class DetectionPredictor(BasePredictor):
                         D = max_i(C_i) and C = number of scales
         """
         import torch
+
+        #print(feat_maps[0].shape)
+        #print(feat_maps2[0].shape)
+        #exit()
 
         if not expanded_feats:
             # original “min‐reduce” path
@@ -142,10 +146,25 @@ class DetectionPredictor(BasePredictor):
         # stack all scales → [B, total_anchors, target_dim + num_scales]
         obj = torch.cat(all_scales, dim=1)
         # pick out only the requested indices per image
-        return [
+        ret=[
             feats[i] if len(i) else []
             for feats, i in zip(obj, idxs)
         ]
+        #print(len(ret))
+        #print(ret[0].shape)
+        #print(feat_maps2[0].shape)
+        #exit()
+        B=len(ret)
+        ret2=[]
+        for b in range(B):
+            ret_b = ret[b]  # [N, M(B)]
+            idx = idxs[b]  # [M(B)]
+
+            selected_feat = feat_maps2[0][b][:, idx]  # [110, M(B)]
+            selected_feat_T = selected_feat.T
+            subtensor = selected_feat_T[:, 4:44] # just class scores
+            ret2.append(torch.cat([subtensor, ret_b], dim=1))
+        return ret2
 
     def construct_results(self, preds, img, orig_imgs):
         """

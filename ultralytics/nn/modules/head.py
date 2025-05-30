@@ -294,27 +294,34 @@ class Pose(Detect):
             return y
 
 class ReIDAdapter(nn.Module):
-    def __init__(self, in_dim=520, hidden=384, emb=192):
+    def __init__(self, in_dim=520, hidden1=192,hidden2=128, emb=64):
         super().__init__()
         # split off the 8-dim one-hot from the 520
+        #self.zero_layer = ZeroOutSlice(start=0, end=40)
         self.in_dim=in_dim
         self.feat_dim = in_dim - 8
         # FiLM generator: one-hot → (γ, β) each of size feat_dim
         self.film = nn.Sequential(
-            nn.Linear(8, 64), nn.ReLU(),
-            nn.Linear(64, 2 * self.feat_dim)
+            nn.Linear(8, 2 * self.feat_dim)
         )
         # small bottleneck MLP on modulated features
         self.mlp = nn.Sequential(
-            nn.Linear(self.feat_dim, hidden),
+            nn.Linear(self.feat_dim, hidden1),
+            #nn.LeakyReLU(negative_slope=0.01),
             nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(hidden, emb),
+            nn.Dropout(0.05),
+            nn.Linear(hidden1, hidden2),
+            #nn.LeakyReLU(negative_slope=0.01),
+            nn.ReLU(),
+            nn.Dropout(0.05),
+            nn.Linear(hidden2, emb),
             nn.LayerNorm(emb)
         )
+        self.scale = nn.Parameter(torch.tensor(10.0))
 
     def forward(self, x):
         # x: [B, 520]
+
         feats, scale_code = x[:, :self.feat_dim], x[:, self.feat_dim:]
 
         # pad scale_code to length 8 if needed
@@ -326,7 +333,7 @@ class ReIDAdapter(nn.Module):
         γ, β = γβ.chunk(2, dim=1)
         feats = feats * (1 + γ) + β                       # FiLM modulation
         emb = self.mlp(feats)                             # → [B, emb]
-        return F.normalize(emb, p=2, dim=1)
+        return F.normalize(emb, p=2, dim=1) * self.scale
 
 class PoseReID(Pose):
     def __init__(self, *args, **kwargs):
