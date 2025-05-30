@@ -2107,6 +2107,23 @@ class Albumentations:
             - Requires the Albumentations library to be installed.
         """
 
+        # mdb remove small boxes
+        bboxes = labels["instances"].bboxes
+        bbox_widths = bboxes[:, 2] - bboxes[:, 0]
+        bbox_heights = bboxes[:, 3] - bboxes[:, 1]
+        condition = (bbox_widths < 20) | (bbox_heights < 20)
+        indexes = np.where(condition)[0]
+
+        if len(indexes)>0:
+            cls_new = np.delete(labels["cls"], indexes, axis=0)
+            bbox_new = np.delete(bboxes, indexes, axis=0)
+            kp_new=np.delete(labels["instances"].keypoints, indexes, axis=0)
+            labels["cls"] =cls_new
+            labels["instances"].update(bboxes=bbox_new, keypoints=kp_new)
+
+        #print(labels["instances"].keypoints)
+        #print(bboxes)
+
         if self.transform is None or random.random() > self.p:
             return labels
 
