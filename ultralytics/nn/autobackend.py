@@ -664,6 +664,11 @@ class AutoBackend(nn.Module):
                         self.bindings[name].data.resize_(tuple(self.context.get_binding_shape(i)))
 
             s = self.bindings["images"].shape
+            # MDB
+            #print("HERE!!!!\n\n\n", im.shape)
+            #flat_tensor = im.squeeze(0).contiguous().view(-1).to(torch.float32)
+            #flat_tensor.cpu().numpy().tofile("/mldata/image/trt_inf.bin")
+
             assert im.shape == s, f"input size {im.shape} {'>' if self.dynamic else 'not equal to'} max model size {s}"
             self.binding_addrs["images"] = int(im.data_ptr())
             self.context.execute_v2(list(self.binding_addrs.values()))

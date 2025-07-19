@@ -294,7 +294,7 @@ class Pose(Detect):
             return y
 
 class ReIDAdapter(nn.Module):
-    def __init__(self, in_dim=520, hidden1=192,hidden2=128, emb=64):
+    def __init__(self, in_dim=560, hidden1=192,hidden2=128, emb=64):
         super().__init__()
         # split off the 8-dim one-hot from the 520
         #self.zero_layer = ZeroOutSlice(start=0, end=40)
@@ -309,11 +309,11 @@ class ReIDAdapter(nn.Module):
             nn.Linear(self.feat_dim, hidden1),
             #nn.LeakyReLU(negative_slope=0.01),
             nn.ReLU(),
-            nn.Dropout(0.05),
+            nn.Dropout(0.1),
             nn.Linear(hidden1, hidden2),
             #nn.LeakyReLU(negative_slope=0.01),
             nn.ReLU(),
-            nn.Dropout(0.05),
+            nn.Dropout(0.1),
             nn.Linear(hidden2, emb),
             nn.LayerNorm(emb)
         )
@@ -336,19 +336,38 @@ class ReIDAdapter(nn.Module):
         return F.normalize(emb, p=2, dim=1) * self.scale
 
 class PoseReID(Pose):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.reid = ReIDAdapter()
+    def __init__(self, nc=80, kpt_shape=(17, 3), ch=()):
+        super().__init__(nc=nc, kpt_shape=kpt_shape, ch=ch)
+        self.nc=nc
+        self.reid = ReIDAdapter(in_dim=520+nc)
         self.feat_dim = self.reid.feat_dim
         self.code_dim = self.reid.in_dim - self.feat_dim
 
     def forward(self, x):
 
+        # --- 1) Run the original Pose head in “export” mode ---
+        #     this yields [B, A, D_det + D_kpt] in x if export=True
+        #assert self.export, "PoseReID only supported in export mode"
+        x_clone=[y.clone() for y in x]
+        r= super().forward(x)  # Tensor [B, A, D_det + D_kpt]
+        if self.training:
+            return r
+        if self.export:
+            # In export mode: single tensor [N, 6 + K*D]
+            preds = r
+        else:
+            # In inference mode: x = (preds, indices), both per image
+            preds, indices = r  # unpack
+
+        # -- extract the class outputs
+        preds_perm=preds.permute(0, 2, 1)
+        classes = preds_perm[:, :, 4:(4+self.nc)]  # shape: (B, N, 40)
+
         # --- 2) Build the expanded anchor features [B, A, feat_dim+code_dim] ---
-        target_dim = max(feat.shape[1] for feat in x)
-        num_scales = len(x)
+        target_dim = max(feat.shape[1] for feat in x_clone)
+        num_scales = max(8, len(x_clone))
         all_scales = []
-        for i, feat in enumerate(x):
+        for i, feat in enumerate(x_clone):
             B, C, H, W = feat.shape
             N = H * W
             flat = feat.permute(0,2,3,1).reshape(B, N, C)
@@ -359,25 +378,12 @@ class PoseReID(Pose):
             code[:, :, i] = 1
             all_scales.append(torch.cat([flat, code], dim=2))
         feats = torch.cat(all_scales, dim=1)  # [B, A, feat_dim+code_dim]
+        feats = torch.cat([classes, feats], dim=2) # pre-pend classes
         # --- 3) Run your ReIDAdapter on every anchor ---
         B, A, _ = feats.shape
         flat_feats = feats.reshape(B*A, -1)            # [B*A, feat_dim+code_dim]
         emb = self.reid(flat_feats)                  # [B*A, 192]
-        #emb = emb.reshape(B, A, -1)                     # [B, A, 192]
         emb = emb.view(B, A, -1).permute(0, 2, 1)
-
-        # --- 1) Run the original Pose head in “export” mode ---
-        #     this yields [B, A, D_det + D_kpt] in x if export=True
-        #assert self.export, "PoseReID only supported in export mode"
-        r= super().forward(x)  # Tensor [B, A, D_det + D_kpt]
-        if self.training:
-            return r
-        if self.export:
-            # In export mode: single tensor [N, 6 + K*D]
-            preds = r
-        else:
-            # In inference mode: x = (preds, indices), both per image
-            preds, indices = r  # unpack
 
         combined_pred=torch.cat([preds, emb], dim=1)
 

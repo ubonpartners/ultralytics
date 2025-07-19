@@ -71,6 +71,8 @@ class DetectionPredictor(BasePredictor):
             orig_imgs = ops.convert_torch2numpy_batch(orig_imgs)
 
         if save_feats:
+            # _feats and _feats2 are the input and output of the last layer
+            # respectively and must be set in "prehook"
             obj_feats = self.get_obj_feats(self._feats,self._feats2, preds[1], expanded_feats=expanded_feats)
             preds = preds[0]
 
@@ -156,13 +158,15 @@ class DetectionPredictor(BasePredictor):
         #exit()
         B=len(ret)
         ret2=[]
+        nc=len(self.model.names)
+        #print(nc)
         for b in range(B):
             ret_b = ret[b]  # [N, M(B)]
             idx = idxs[b]  # [M(B)]
 
             selected_feat = feat_maps2[0][b][:, idx]  # [110, M(B)]
             selected_feat_T = selected_feat.T
-            subtensor = selected_feat_T[:, 4:44] # just class scores
+            subtensor = selected_feat_T[:, 4:(4+nc)] # just class scores
             ret2.append(torch.cat([subtensor, ret_b], dim=1))
         return ret2
 

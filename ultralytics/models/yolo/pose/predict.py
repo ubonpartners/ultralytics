@@ -86,10 +86,10 @@ class PoseReIDPredictor(PosePredictor):
         self.args.task = "pose_reid"
 
     def construct_result(self, pred, img, orig_img, img_path):
-        # pred is [B, C, A], e.g. [1, 110 + 192, 8400]
+        # pred is [B, C, A], e.g. [1, 110 + 64, 8400]
         if pred.numel():
-            reid_emb = pred[:, -192:]           # [B, 192, A]
-            pred = pred[:, :-192]               # [B, C-192, A]
+            reid_emb = pred[:, -64:]           # [B, 64, A]
+            pred = pred[:, :-64]               # [B, C-64, A]
         else:
             reid_emb = None
         result = super().construct_result(pred, img, orig_img, img_path)
