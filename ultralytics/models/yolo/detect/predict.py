@@ -95,9 +95,13 @@ class DetectionPredictor(BasePredictor):
     def get_obj_feats(self, feat_maps,feat_maps2, idxs, expanded_feats=False):
         """
         feat_maps: list of 3 (or N) tensors [B, C_i, H_i, W_i]
+        feat_maps2: tensor containing predicted classes
         idxs:      list of index lists per image
-        expanded_feats: if True, output [B, total_anchors, D+C] where
+        expanded_feats: if True, output [B, total_anchors, D+C+NC] where
                         D = max_i(C_i) and C = number of scales
+                        Made from concat of -input to head
+                                            -1-hot encoding of which scales used
+                                            -class predictions
         """
         import torch
 
@@ -147,7 +151,7 @@ class DetectionPredictor(BasePredictor):
         obj = torch.cat(all_scales, dim=1)
         # pick out only the requested indices per image
         ret=[
-            feats[i] if len(i) else []
+            feats[i] if len(i) else feats.new_empty((0, feats.shape[-1]))
             for feats, i in zip(obj, idxs)
         ]
         #print(len(ret))
@@ -159,6 +163,13 @@ class DetectionPredictor(BasePredictor):
         for b in range(B):
             ret_b = ret[b]  # [N, M(B)]
             idx = idxs[b]  # [M(B)]
+
+            if idx.numel() == 0:
+                print("MDB warning empty idx in get_obj_feats")
+                # build an empty tensor of shape [0, nc + target_dim + num_scales]
+                empty_feat = feat_maps2[0].new_empty((0, nc + obj.shape[-1]))
+                ret2.append(empty_feat)
+                continue
 
             selected_feat = feat_maps2[0][b][:, idx]  # [110, M(B)]
             selected_feat_T = selected_feat.T

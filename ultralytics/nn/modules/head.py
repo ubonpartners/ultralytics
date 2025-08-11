@@ -342,7 +342,66 @@ class PoseReID(Pose):
         self.feat_dim = self.reid.feat_dim
         self.code_dim = self.reid.in_dim - self.feat_dim
 
+    def forward_export_opt(self, x):
+        # 1) clone inputs so we never mutate original features
+        x_clone = [feat.clone() for feat in x]
+
+        # 2) run detection head
+        preds = super().forward(x)               # [B, C_det+D_kpt, A]
+
+        # 3) extract class scores → [B, A, nc]
+        #    preds is [B, C, A] so permute to [B, A, C] then slice
+        preds_pa = preds.permute(0, 2, 1)        # [B, A, C]
+        classes = preds_pa[..., 4 : 4 + self.nc] # [B, A, nc]
+
+        target_dim = 512
+        num_scales = 8
+        assert len(x_clone) == 3
+        assert [x.shape[1] for x in x_clone] == [256, 512, 512]  # C values
+        all_scales = []
+
+        for i in range(3):
+            feat = x_clone[i]  # [B, C, H, W]
+            B, C, H, W = feat.shape
+            N = H * W
+            print(C,H,W)
+            assert C==(256 if (i==0) else 512)
+
+            # Flatten spatial dimensions → [B, N, C]
+            flat = feat.permute(0, 2, 3, 1).reshape(B, N, C)
+
+            # Pad if C < target_dim (only for C=256)
+            if C < target_dim:
+                # Pad last dimension with zeros to reach 512
+                pad = torch.zeros((B, N, target_dim - C), device=flat.device, dtype=flat.dtype)
+                flat = torch.cat((flat, pad), dim=2)
+
+            # Build one-hot scale code [B, N, 8]
+            code = torch.zeros((B, N, num_scales), device=flat.device, dtype=flat.dtype)
+            code[:, :, i] = 1
+
+            # Concat → [B, N, 520]
+            enriched = torch.cat((flat, code), dim=2)
+            all_scales.append(enriched)
+
+        # Concatenate all scales → [B, A, 520]
+        feats = torch.cat(all_scales, dim=1)
+
+        # Append class predictions: [B, A, nc + 520]
+        feats = torch.cat((classes, feats), dim=2)
+
+        # 5) run ReID head per‑anchor
+        B, A, D = feats.shape
+        flat_feats = feats.reshape(B * A, D)                        # [B*A, D]
+        emb = self.reid(flat_feats)                                 # [B*A, 192]
+        emb = emb.reshape(B, A, -1).permute(0, 2, 1)                 # [B, 192, A]
+
+        # 6) stitch embeddings back onto preds
+        return torch.cat((preds, emb), dim=1)
+
     def forward(self, x):
+        #if self.export:
+        #    return self.forward_export_opt(x)
 
         # --- 2) Build the expanded anchor features [B, A, feat_dim+code_dim] ---
         target_dim = max(feat.shape[1] for feat in x)
