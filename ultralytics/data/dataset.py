@@ -370,8 +370,11 @@ class YOLOMultilabelDataset(YOLODataset):
                     for i in range(len(unique_bboxes)):
                         labels[i] = one_hot_encode(lb[indices == i, 0].astype(np.int32), num_classes)
                     # MDB: fix keypoints for reduced boxes
-                    keypoint2=keypoint[fwd_index]
-                    assert(len(keypoint2)==len(unique_bboxes))
+                    if keypoint is not None:
+                        keypoint2=keypoint[fwd_index]
+                        assert(len(keypoint2)==len(unique_bboxes))
+                    else:
+                        keypoint2=None
                     x["labels"].append(
                         {
                             "im_file": im_file,
