@@ -125,7 +125,7 @@ class DetectionPredictor(BasePredictor):
         target_dim = max(x.shape[1] for x in feat_maps)
         # 2) one-hot size = number of scales
         num_scales = max(8, len(feat_maps))
-
+        nc=len(self.model.names)
         all_scales = []
         for scale_idx, x in enumerate(feat_maps):
             B, C, H, W = x.shape
@@ -173,7 +173,7 @@ class DetectionPredictor(BasePredictor):
 
             selected_feat = feat_maps2[0][b][:, idx]  # [110, M(B)]
             selected_feat_T = selected_feat.T
-            subtensor = selected_feat_T[:, 4:44] # just class scores
+            subtensor = selected_feat_T[:, 4:(4+nc)] # just class scores
             ret2.append(torch.cat([subtensor, ret_b], dim=1))
         return ret2
 
