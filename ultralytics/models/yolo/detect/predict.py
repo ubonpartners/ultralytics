@@ -99,9 +99,9 @@ class DetectionPredictor(BasePredictor):
         idxs:      list of index lists per image
         expanded_feats: if True, output [B, total_anchors, D+C+NC] where
                         D = max_i(C_i) and C = number of scales
-                        Made from concat of -input to head
+                        Made from concat of -class predictions
+                                            -input to head
                                             -1-hot encoding of which scales used
-                                            -class predictions
         """
         import torch
 
@@ -124,7 +124,6 @@ class DetectionPredictor(BasePredictor):
         # 1) figure out the “wide” dimension = the largest channel size among inputs
         target_dim = max(x.shape[1] for x in feat_maps)
         # 2) one-hot size = number of scales
-        num_scales = max(8, len(feat_maps))
         nc=len(self.model.names)
         all_scales = []
         for scale_idx, x in enumerate(feat_maps):
@@ -141,7 +140,7 @@ class DetectionPredictor(BasePredictor):
                 feat_wide = flat
 
             # build a dynamic one-hot of length=num_scales
-            one_hot = flat.new_zeros(B, N, num_scales)
+            one_hot = flat.new_zeros(B, N, 8)
             one_hot[:, :, scale_idx] = 1.0
 
             # concat → [B, N, target_dim + num_scales]
@@ -167,11 +166,11 @@ class DetectionPredictor(BasePredictor):
             if idx.numel() == 0:
                 print("MDB warning empty idx in get_obj_feats")
                 # build an empty tensor of shape [0, nc + target_dim + num_scales]
-                empty_feat = feat_maps2[0].new_empty((0, nc + obj.shape[-1]))
+                empty_feat = feat_maps2.new_empty((0, nc + obj.shape[-1]))
                 ret2.append(empty_feat)
                 continue
 
-            selected_feat = feat_maps2[0][b][:, idx]  # [110, M(B)]
+            selected_feat = feat_maps2[b][:, idx]  # [110, M(B)]
             selected_feat_T = selected_feat.T
             subtensor = selected_feat_T[:, 4:(4+nc)] # just class scores
             ret2.append(torch.cat([subtensor, ret_b], dim=1))
