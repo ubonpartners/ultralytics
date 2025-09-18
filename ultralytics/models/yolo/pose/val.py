@@ -19,7 +19,7 @@ from ultralytics.utils.metrics import (
     box_iou,
     kpt_iou,
 )
-from ultralytics.utils.plotting import output_to_target, plot_images
+from ultralytics.utils.plotting import plot_images
 
 
 class PoseValidator(DetectionValidator):

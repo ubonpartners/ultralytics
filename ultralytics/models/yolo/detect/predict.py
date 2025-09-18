@@ -54,7 +54,7 @@ class DetectionPredictor(BasePredictor):
         """
         save_feats = getattr(self, "save_feats", False) or (getattr(self, "_feats", None) is not None)
         expanded_feats = getattr(self, "expanded_feats", False)
-        preds = ops.non_max_suppression(
+        preds = nms.non_max_suppression(
             preds,
             self.args.conf,
             self.args.iou,
