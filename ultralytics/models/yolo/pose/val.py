@@ -10,7 +10,16 @@ import torch
 
 from ultralytics.models.yolo.detect import DetectionValidator
 from ultralytics.utils import LOGGER, ops
-from ultralytics.utils.metrics import OKS_SIGMA, PoseMetrics, kpt_iou
+from ultralytics.utils.checks import check_requirements
+from ultralytics.utils.metrics import (
+    OKS_SIGMA,
+    FACEPOSE_SIGMA,
+    FACEPOSEBOX_SIGMA,
+    PoseMetrics,
+    box_iou,
+    kpt_iou,
+)
+from ultralytics.utils.plotting import output_to_target, plot_images
 
 
 class PoseValidator(DetectionValidator):
@@ -115,8 +124,18 @@ class PoseValidator(DetectionValidator):
         super().init_metrics(model)
         self.kpt_shape = self.data["kpt_shape"]
         is_pose = self.kpt_shape == [17, 3]
+        is_facepose = self.kpt_shape == [22, 3]
+        is_faceposebox = self.kpt_shape == [23, 3]
         nkpt = self.kpt_shape[0]
-        self.sigma = OKS_SIGMA if is_pose else np.ones(nkpt) / nkpt
+        if is_pose:
+            self.sigma = OKS_SIGMA
+        elif is_facepose:
+            self.sigma = FACEPOSE_SIGMA
+        elif is_faceposebox:
+            self.sigma = FACEPOSEBOX_SIGMA
+        else:
+            self.sigma = np.ones(nkpt) / nkpt
+        self.stats = dict(tp_p=[], tp=[], conf=[], pred_cls=[], target_cls=[], target_img=[])
 
     def postprocess(self, preds: torch.Tensor) -> dict[str, torch.Tensor]:
         """
@@ -169,7 +188,11 @@ class PoseValidator(DetectionValidator):
         kpts = kpts.clone()
         kpts[..., 0] *= w
         kpts[..., 1] *= h
+        kpts = ops.scale_coords(pbatch["imgsz"], kpts, pbatch["ori_shape"], ratio_pad=pbatch["ratio_pad"])
         pbatch["keypoints"] = kpts
+        # multi-label - replicate/expand GT keypoints for any consumers that expect per-class rows
+        if "rows" in pbatch:
+            pbatch["kpts"] = kpts[pbatch["rows"]]
         return pbatch
 
     def _process_batch(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> dict[str, np.ndarray]:

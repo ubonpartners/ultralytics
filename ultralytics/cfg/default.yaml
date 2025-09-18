@@ -45,6 +45,7 @@ mask_ratio: 4 # (int) mask downsample ratio (segment only)
 
 # Classification
 dropout: 0.0 # (float) dropout for classification head (classify only)
+multilabel: True # (bool) enable multi-label classification
 
 # Val/Test settings ----------------------------------------------------------------------------------------------------
 val: True # (bool) run validation/testing during training
@@ -100,6 +101,7 @@ warmup_momentum: 0.8 # (float) initial momentum during warmup
 warmup_bias_lr: 0.1 # (float) bias learning rate during warmup
 box: 7.5 # (float) box loss gain
 cls: 0.5 # (float) classification loss gain
+attr: 0.25 # (float) attribute loss gain
 dfl: 1.5 # (float) distribution focal loss gain
 pose: 12.0 # (float) pose loss gain (pose tasks)
 kobj: 1.0 # (float) keypoint objectness loss gain (pose tasks)

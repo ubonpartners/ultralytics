@@ -141,13 +141,25 @@ class DetectionValidator(BaseValidator):
             (dict[str, Any]): Prepared batch with processed annotations.
         """
         idx = batch["batch_idx"] == si
-        cls = batch["cls"][idx].squeeze(-1)
+        cls = batch["cls"][idx]
         bbox = batch["bboxes"][idx]
+
+        # multi-label: replicate/expand GT keypoints
+        rows, cols = torch.where(cls == 1)
+        num_classes = cls.size(1)
+        new_cls = torch.zeros((len(rows), num_classes), dtype=torch.int)
+        new_cls[torch.arange(len(rows)), cols] = 1
+        # Replicate the box tensor correspondingly
+        new_bbox = bbox[rows]
+        cls=new_cls.to(self.device)
+        bbox=new_bbox.to(self.device)
+
         ori_shape = batch["ori_shape"][si]
         imgsz = batch["img"].shape[2:]
         ratio_pad = batch["ratio_pad"][si]
         if cls.shape[0]:
             bbox = ops.xywh2xyxy(bbox) * torch.tensor(imgsz, device=self.device)[[1, 0, 1, 0]]  # target boxes
+            ops.scale_boxes(imgsz, bbox, ori_shape, ratio_pad=ratio_pad)  # native-space labels
         return {
             "cls": cls,
             "bboxes": bbox,
@@ -155,6 +167,7 @@ class DetectionValidator(BaseValidator):
             "imgsz": imgsz,
             "ratio_pad": ratio_pad,
             "im_file": batch["im_file"][si],
+            "rows": rows,
         }
 
     def _prepare_pred(self, pred: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -190,7 +203,7 @@ class DetectionValidator(BaseValidator):
                 {
                     **self._process_batch(predn, pbatch),
                     "target_cls": cls,
-                    "target_img": np.unique(cls),
+                    "target_img": np.unique(np.nonzero(cls)[1]),#np.unique(cls),
                     "conf": np.zeros(0) if no_pred else predn["conf"].cpu().numpy(),
                     "pred_cls": np.zeros(0) if no_pred else predn["cls"].cpu().numpy(),
                 }
@@ -312,7 +325,10 @@ class DetectionValidator(BaseValidator):
             ni (int): Batch index.
         """
         plot_images(
-            labels=batch,
+            batch["img"],
+            batch["batch_idx"],
+            batch["cls"],
+            batch["bboxes"],
             paths=batch["im_file"],
             fname=self.save_dir / f"val_batch{ni}_labels.jpg",
             names=self.names,

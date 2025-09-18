@@ -20,7 +20,7 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment"
+__all__ = "Detect", "Segment", "Pose", "PoseReID", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment"
 
 
 class Detect(nn.Module):
@@ -381,6 +381,7 @@ class Pose(Detect):
 
     def forward(self, x: list[torch.Tensor]) -> torch.Tensor | tuple:
         """Perform forward pass through YOLO model and return predictions."""
+
         bs = x[0].shape[0]  # batch size
         kpt = torch.cat([self.cv4[i](x[i]).view(bs, self.nk, -1) for i in range(self.nl)], -1)  # (bs, 17*3, h*w)
         x = Detect.forward(self, x)
@@ -423,6 +424,155 @@ class Pose(Detect):
             y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
             return y
 
+class ReIDAdapter(nn.Module):
+    def reid_layer_checksums(self):
+        print("Checksums\n")
+        print(self.state_dict)
+        for name, p in self.state_dict().items():
+            s = p.detach().float().sum().item()
+            print(f"{name:30s} sum={s:.6e}")
+
+    def __init__(self, in_dim=575, hidden1=160, hidden2=192, emb=80):
+        super().__init__()
+        # split off the 8-dim one-hot from the 520
+        #self.zero_layer = ZeroOutSlice(start=0, end=40)
+
+        self.in_dim=in_dim
+        self.emb=emb
+        self.feat_dim = in_dim - 8
+        # FiLM generator: one-hot → (γ, β) each of size feat_dim
+        self.film = nn.Sequential(
+            nn.Linear(8, 2 * self.feat_dim)
+        )
+        # small bottleneck MLP on modulated features
+        self.mlp = nn.Sequential(
+            nn.Linear(self.feat_dim, hidden1),
+            #nn.LeakyReLU(negative_slope=0.01),
+            nn.ReLU(),
+            nn.Dropout(0.05),
+            nn.Linear(hidden1, hidden2),
+            #nn.LeakyReLU(negative_slope=0.01),
+            nn.ReLU(),
+            nn.Dropout(0.05),
+            nn.Linear(hidden2, emb),
+            nn.LayerNorm(emb)
+        )
+        self.scale = nn.Parameter(torch.tensor(10.0))
+
+    def forward(self, x):
+        #print(x.shape)
+        #self.reid_layer_checksums()
+        #if x.shape[0]==8400:
+        #    row_8243 = x[8243]        # shape: [575]
+
+            # convert to numpy for convenience
+        #    vals = row_8243.cpu().numpy()
+
+            # print 20 values per line
+        #    for i in range(0, len(vals), 20):
+        #        print(" ".join(f"{v:.4f}" for v in vals[i:i+20]))
+        # x: [B, 520]
+        feats, scale_code = x[:, :self.feat_dim], x[:, self.feat_dim:]
+
+        # pad scale_code to length 8 if needed
+        pad_len = 8 - scale_code.shape[1]
+        assert pad_len==0
+        if pad_len > 0:
+            scale_code = F.pad(scale_code, (0, pad_len))  # pad on the right
+
+        γβ = self.film(scale_code)                        # [B, 2*feat_dim]
+        γ, β = γβ.chunk(2, dim=1)
+        feats = feats * (1 + γ) + β                       # FiLM modulation
+        emb = self.mlp(feats)                             # → [B, emb]
+        return F.normalize(emb, p=2, dim=1) * self.scale
+
+class PoseReID(Pose):
+    CODE_LEN = 8      # ReIDAdapter expects the last 8 dims as FiLM code
+    FEAT_WIDTH = 512  # expected per-anchor feature width after padding
+    FEAT_PLUS_CODE = FEAT_WIDTH + CODE_LEN  # 512 + 8 = 520
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        #print(f"PoseReID nc={self.nc}")
+        # Total ReID input = nc + (FEAT_PLUS_CODE)
+        self.reid = ReIDAdapter(in_dim=self.nc + self.FEAT_PLUS_CODE)
+
+    # --- helper: slice class scores robustly using A to disambiguate layout ---
+    def _slice_cls_scores(self, preds, A):
+        """
+        Returns [B, A, nc] by slicing preds' class block [4:4+nc].
+        Works for preds shaped [B, D, A] or [B, A, D] by checking which dim equals A.
+        """
+        if preds.dim() != 3:
+            raise RuntimeError(f"preds must be 3D, got {tuple(preds.shape)}")
+
+        B = preds.shape[0]
+        if preds.shape[-1] == A:
+            # Layout: [B, D, A]  -> slice along D, then permute to [B, A, nc]
+            out = preds[:, 4:4 + self.nc, :].permute(0, 2, 1)  # [B, A, nc]
+        elif preds.shape[1] == A:
+            # Layout: [B, A, D]  -> slice along last dim directly
+            out = preds[:, :, 4:4 + self.nc]                   # [B, A, nc]
+        else:
+            raise RuntimeError(
+                f"Cannot infer layout from preds shape {tuple(preds.shape)} with A={A}."
+                " Expected A to be either dim=1 or dim=2."
+            )
+        # (Optional) mild sanity checks
+        if out.shape[0] != B or out.shape[1] != A or out.shape[2] != self.nc:
+            raise RuntimeError(f"Sliced class scores wrong shape: {tuple(out.shape)}, expected [{B}, {A}, {self.nc}]")
+        return out
+
+    def forward(self, x):
+        # 1) Run the original Pose head
+        xc=[y.clone() for y in x]
+        r = super().forward(xc)
+        if self.training:
+            return r
+
+        if self.export:
+            preds = r
+        else:
+            preds, indices = r  # indices unused here; kept for API compatibility
+
+        # 2) Build per-anchor features with fixed 8-long one-hot code
+        target_dim = max(feat.shape[1] for feat in x)  # e.g., 512
+        all_scales = []
+        for i, feat in enumerate(x):
+            B, C, H, W = feat.shape
+            N = H * W
+            flat = feat.permute(0, 2, 3, 1).reshape(B, N, C)  # [B, N, C]
+            if C < target_dim:
+                flat = torch.cat([flat, flat.new_zeros(B, N, target_dim - C)], dim=2)
+
+            code = flat.new_zeros(B, N, self.CODE_LEN)  # fixed 8
+            code[:, :, min(i, self.CODE_LEN - 1)] = 1   # bucket extras to last slot
+            all_scales.append(torch.cat([flat, code], dim=2))  # [B, N, target_dim+8]
+
+        feats = torch.cat(all_scales, dim=1)            # [B, A, target_dim+8]
+        B, A, Ftot = feats.shape
+
+        # Warn if model feature width differs from configured FEAT_WIDTH
+        built_feat_plus_code = target_dim + self.CODE_LEN
+        if built_feat_plus_code != self.FEAT_PLUS_CODE:
+            print(f"[PoseReID] Warning: built feature+code {built_feat_plus_code} != configured {self.FEAT_PLUS_CODE}. "
+                  f"ReIDAdapter was constructed for nc+{self.FEAT_PLUS_CODE}.")
+
+        flat_feats = feats.reshape(B * A, Ftot)         # [B*A, target_dim+8]
+
+        # 3) Slice class scores correctly and prepend
+        cls_scores = self._slice_cls_scores(preds, A)   # [B, A, nc]
+        cls_scores_flat = cls_scores.reshape(B * A, self.nc)  # [B*A, nc]
+
+        reid_input = torch.cat([cls_scores_flat, flat_feats], dim=1)  # [B*A, nc + (target_dim+8)]
+
+        # 4) Run ReID and append embeddings to preds
+        emb = self.reid(reid_input)                     # [B*A, emb]
+        emb = emb.view(B, A, -1).permute(0, 2, 1)       # [B, emb, A]
+
+        combined_pred = torch.cat([preds, emb], dim=1)  # match parent layout
+
+        return combined_pred if self.export else (combined_pred, indices)
 
 class Classify(nn.Module):
     """

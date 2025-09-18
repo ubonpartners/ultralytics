@@ -1872,7 +1872,6 @@ class CopyPaste(BaseMixTransform):
         labels1["instances"] = instances
         return labels1
 
-
 class Albumentations:
     """
     Albumentations transformations for image augmentation.
@@ -1990,11 +1989,17 @@ class Albumentations:
             T = [
                 A.Blur(p=0.01),
                 A.MedianBlur(p=0.01),
+                A.MotionBlur(p=0.01),
                 A.ToGray(p=0.01),
                 A.CLAHE(p=0.01),
-                A.RandomBrightnessContrast(p=0.0),
-                A.RandomGamma(p=0.0),
-                A.ImageCompression(quality_range=(75, 100), p=0.0),
+                A.RandomBrightnessContrast(p=0.01),
+                A.RandomGamma(p=0.01),
+                A.ISONoise(p=0.005),
+                A.ChromaticAberration(p=0.005),
+                A.RandomRain(p=0.005),
+                A.RandomFog(p=0.005),
+                A.RandomSunFlare(p=0.005),
+                A.ImageCompression(quality_range=(30, 100), p=0.01)
             ]
 
             # Compose transforms
@@ -2044,6 +2049,7 @@ class Albumentations:
             - Spatial transforms update bounding boxes, while non-spatial transforms only modify the image.
             - Requires the Albumentations library to be installed.
         """
+
         if self.transform is None or random.random() > self.p:
             return labels
 

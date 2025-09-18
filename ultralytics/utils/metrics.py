@@ -19,6 +19,15 @@ OKS_SIGMA = (
     / 10.0
 )
 
+# yolo-dpa : alternate OKS_SIGMA for when there are 22=5 facepoints + 17 pose points
+FACEPOSE_SIGMA = (
+    np.array([0.25, 0.25, 0.26, 0.25, 0.25, 0.26, 0.25, 0.25, 0.35, 0.35, 0.79, 0.79, 0.72, 0.72, 0.62, 0.62, 1.07, 1.07, 0.87, 0.87, 0.89, 0.89])
+    / 10.0
+)
+# alternate OKS_SIGMA for when there are 23=17 pose points+2 additional face points + 4 face box points
+FACEPOSEBOX_SIGMA = (
+    np.array([0.26, 0.25, 0.25, 0.35, 0.35, 0.79, 0.79, 0.72, 0.72, 0.62, 0.62, 1.07, 1.07, 0.87, 0.87, 0.89, 0.89,0.25, 0.25, 0.9, 0.9, 0.9, 0.9])/ 10.0
+)
 
 def bbox_ioa(box1: np.ndarray, box2: np.ndarray, iou: bool = False, eps: float = 1e-7) -> np.ndarray:
     """
@@ -386,11 +395,11 @@ class ConfusionMatrix(DataExportMixin):
         Update confusion matrix for object detection task.
 
         Args:
-            detections (dict[str, torch.Tensor]): Dictionary containing detected bounding boxes and their associated information.
-                                       Should contain 'cls', 'conf', and 'bboxes' keys, where 'bboxes' can be
-                                       Array[N, 4] for regular boxes or Array[N, 5] for OBB with angle.
-            batch (dict[str, Any]): Batch dictionary containing ground truth data with 'bboxes' (Array[M, 4]| Array[M, 5]) and
-                'cls' (Array[M]) keys, where M is the number of ground truth objects.
+            detections (dict[str, torch.Tensor]): Dictionary containing detected bounding boxes and their associated
+                information. Must contain 'cls', 'conf', and 'bboxes' keys, where 'bboxes' can be Array[N, 4] for
+                regular boxes or Array[N, 5] for OBB with angle.
+            batch (dict[str, Any]): Batch dictionary containing ground truth data with 'bboxes' (Array[M, 4] | Array[M, 5]) and
+                'cls' (Array[M] | Array[M, nc]) keys. If 'cls' is 2D it's treated as multi-label one-hot.
             conf (float, optional): Confidence threshold for detections.
             iou_thres (float, optional): IoU threshold for matching detections to ground truth.
         """
@@ -411,14 +420,20 @@ class ConfusionMatrix(DataExportMixin):
                     self._append_matches("FP", detections, i)
             return
         if no_pred:
-            gt_classes = gt_cls.int().tolist()
-            for i, gc in enumerate(gt_classes):
-                self.matrix[self.nc, gc] += 1  # FN
-                self._append_matches("FN", batch, i)
+            # Handle single-label and multi-label GT
+            if gt_cls.ndim == 1 or (gt_cls.ndim == 2 and gt_cls.shape[1] == 1):
+                gt_classes = gt_cls.int().tolist()
+                for i, gc in enumerate(gt_classes):
+                    self.matrix[self.nc, gc] += 1  # FN
+                    self._append_matches("FN", batch, i)
+            else:
+                gt_classes = gt_cls.int()
+                for i, gc in enumerate(gt_classes):
+                    for g in np.nonzero(gc.cpu().numpy())[0]:
+                        self.matrix[self.nc, g] += 1  # background FN
             return
 
         detections = {k: detections[k][detections["conf"] > conf] for k in detections}
-        gt_classes = gt_cls.int().tolist()
         detection_classes = detections["cls"].int().tolist()
         bboxes = detections["bboxes"]
         iou = batch_probiou(gt_bboxes, bboxes) if is_obb else box_iou(gt_bboxes, bboxes)
@@ -436,24 +451,42 @@ class ConfusionMatrix(DataExportMixin):
 
         n = matches.shape[0] > 0
         m0, m1, _ = matches.transpose().astype(int)
-        for i, gc in enumerate(gt_classes):
-            j = m0 == i
-            if n and sum(j) == 1:
-                dc = detection_classes[m1[j].item()]
-                self.matrix[dc, gc] += 1  # TP if class is correct else both an FP and an FN
-                if dc == gc:
-                    self._append_matches("TP", detections, m1[j].item())
+        if gt_cls.ndim == 1 or (gt_cls.ndim == 2 and gt_cls.shape[1] == 1):
+            gt_classes = gt_cls.int().tolist()
+            for i, gc in enumerate(gt_classes):
+                j = m0 == i
+                if n and sum(j) == 1:
+                    dc = detection_classes[m1[j].item()]
+                    self.matrix[dc, gc] += 1  # TP if class is correct else both an FP and an FN
+                    if dc == gc:
+                        self._append_matches("TP", detections, m1[j].item())
+                    else:
+                        self._append_matches("FP", detections, m1[j].item())
+                        self._append_matches("FN", batch, i)
                 else:
-                    self._append_matches("FP", detections, m1[j].item())
+                    self.matrix[self.nc, gc] += 1  # FN
                     self._append_matches("FN", batch, i)
-            else:
-                self.matrix[self.nc, gc] += 1  # FN
-                self._append_matches("FN", batch, i)
-
-        for i, dc in enumerate(detection_classes):
-            if not any(m1 == i):
-                self.matrix[dc, self.nc] += 1  # FP
-                self._append_matches("FP", detections, i)
+            for i, dc in enumerate(detection_classes):
+                if not any(m1 == i):
+                    self.matrix[dc, self.nc] += 1  # FP
+                    self._append_matches("FP", detections, i)
+        else:
+            # Multi-label evaluation: count per active class in GT rows
+            gt_classes = gt_cls.int()
+            for i, gc in enumerate(gt_classes):
+                active = np.nonzero(gc.cpu().numpy())[0]
+                j = m0 == i
+                if n and sum(j) == 1:
+                    dc = detection_classes[m1[j].item()]
+                    for g in active:
+                        self.matrix[dc, g] += 1
+                else:
+                    for g in active:
+                        self.matrix[self.nc, g] += 1
+            if n:
+                for i, dc in enumerate(detection_classes):
+                    if not any(m1 == i):
+                        self.matrix[dc, self.nc] += 1
 
     def matrix(self):
         """Return the confusion matrix."""
@@ -798,12 +831,13 @@ def ap_per_class(
         x (np.ndarray): X-axis values for the curves.
         prec_values (np.ndarray): Precision values at mAP@0.5 for each class.
     """
+
     # Sort by objectness
     i = np.argsort(-conf)
     tp, conf, pred_cls = tp[i], conf[i], pred_cls[i]
 
     # Find unique classes
-    unique_classes, nt = np.unique(target_cls, return_counts=True)
+    unique_classes, nt = np.unique(target_cls.nonzero()[1], return_counts=True)
     nc = unique_classes.shape[0]  # number of classes, number of detections
 
     # Create Precision-Recall curve and compute AP for each class

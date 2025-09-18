@@ -331,6 +331,7 @@ class Results(SimpleClass, DataExportMixin):
         probs: torch.Tensor | None = None,
         obb: torch.Tensor | None = None,
         keypoints: torch.Tensor | None = None,
+        reid_embeddings: torch.Tensor | None = None,
     ):
         """
         Update the Results object with new detection data.
@@ -361,6 +362,8 @@ class Results(SimpleClass, DataExportMixin):
             self.obb = OBB(obb, self.orig_shape)
         if keypoints is not None:
             self.keypoints = Keypoints(keypoints, self.orig_shape)
+        if reid_embeddings is not None:
+            self.reid_embeddings = reid_embeddings
 
     def _apply(self, fn: str, *args, **kwargs):
         """
@@ -1222,6 +1225,9 @@ class Keypoints(BaseTensor):
         """
         if keypoints.ndim == 2:
             keypoints = keypoints[None, :]
+        if keypoints.shape[2] == 3:  # x, y, conf
+            mask = keypoints[..., 2] < 0.01  # points with very low conf (not visible)
+            keypoints[..., :2][mask] = 0
         super().__init__(keypoints, orig_shape)
         self.has_visible = self.data.shape[-1] == 3
 

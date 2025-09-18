@@ -14,7 +14,12 @@ from PIL import Image
 from torch.utils.data import dataloader, distributed
 
 from ultralytics.cfg import IterableSimpleNamespace
-from ultralytics.data.dataset import GroundingDataset, YOLODataset, YOLOMultiModalDataset
+from ultralytics.data.dataset import (
+    GroundingDataset,
+    YOLODataset,
+    YOLOMultilabelDataset,
+    YOLOMultiModalDataset,
+)
 from ultralytics.data.loaders import (
     LOADERS,
     LoadImagesAndVideos,
@@ -128,8 +133,17 @@ def build_yolo_dataset(
     stride: int = 32,
     multi_modal: bool = False,
 ):
-    """Build and return a YOLO dataset based on configuration parameters."""
-    dataset = YOLOMultiModalDataset if multi_modal else YOLODataset
+    """Build and return a YOLO dataset based on configuration parameters.
+
+    Honors multilabel datasets if `cfg.multilabel` is True, otherwise uses multi-modal
+    or standard YOLO datasets based on `multi_modal`.
+    """
+    if getattr(cfg, "multilabel", False):
+        dataset = YOLOMultilabelDataset
+    elif multi_modal:
+        dataset = YOLOMultiModalDataset
+    else:
+        dataset = YOLODataset
     return dataset(
         img_path=img_path,
         imgsz=cfg.imgsz,

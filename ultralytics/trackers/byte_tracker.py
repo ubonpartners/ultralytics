@@ -295,6 +295,7 @@ class BYTETracker:
         self.max_time_lost = int(frame_rate / 30.0 * args.track_buffer)
         self.kalman_filter = self.get_kalmanfilter()
         self.reset_id()
+        self.norm_coords=False
 
     def update(self, results, img: np.ndarray | None = None, feats: np.ndarray | None = None) -> np.ndarray:
         """Update the tracker with new detections and return the current list of tracked objects."""
@@ -303,8 +304,16 @@ class BYTETracker:
         refind_stracks = []
         lost_stracks = []
         removed_stracks = []
-
+        h=results.orig_shape[0]
+        w=results.orig_shape[1]
         scores = results.conf
+        if self.norm_coords:
+            bboxes = results.xywhn
+        else:
+            bboxes = results.xywhr if hasattr(results, "xywhr") else results.xywh
+        # Add index
+        bboxes = np.concatenate([bboxes, np.arange(len(bboxes)).reshape(-1, 1)], axis=-1)
+        cls = results.cls
         remain_inds = scores >= self.args.track_high_thresh
         inds_low = scores > self.args.track_low_thresh
         inds_high = scores < self.args.track_high_thresh
@@ -356,7 +365,7 @@ class BYTETracker:
         r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
         # TODO
         dists = matching.iou_distance(r_tracked_stracks, detections_second)
-        matches, u_track, u_detection_second = matching.linear_assignment(dists, thresh=0.5)
+        matches, u_track, u_detection_second = matching.linear_assignment(dists, thresh=0.5, use_lap=True)
         for itracked, idet in matches:
             track = r_tracked_stracks[itracked]
             det = detections_second[idet]
@@ -406,8 +415,14 @@ class BYTETracker:
         self.removed_stracks.extend(removed_stracks)
         if len(self.removed_stracks) > 1000:
             self.removed_stracks = self.removed_stracks[-999:]  # clip remove stracks to 1000 maximum
-
-        return np.asarray([x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
+        r=np.asarray([x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
+        if self.norm_coords:
+            for x in r:
+                x[0]*=w
+                x[1]*=h
+                x[2]*=w
+                x[3]*=h
+        return r
 
     def get_kalmanfilter(self) -> KalmanFilterXYAH:
         """Return a Kalman filter object for tracking bounding boxes using KalmanFilterXYAH."""

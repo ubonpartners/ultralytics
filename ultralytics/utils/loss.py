@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ultralytics.utils.metrics import OKS_SIGMA
+from ultralytics.utils.metrics import OKS_SIGMA, FACEPOSE_SIGMA, FACEPOSEBOX_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import autocast
@@ -200,9 +200,18 @@ class v8DetectionLoss:
         """Initialize v8DetectionLoss with model parameters and task-aligned assignment settings."""
         device = next(model.parameters()).device  # get model device
         h = model.args  # hyperparameters
-
         m = model.model[-1]  # Detect() module
-        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+
+        # yolo-dpa : experiment weight the class loss for the non-attribute classes higher
+        if False:
+            weight = torch.ones(m.nc)  # Initialize with equal weights
+            weight[0] = 2.0
+            weight[1] = 2.0
+            weight[4] = 2.0
+            weight=weight.to(device)
+            self.bce = nn.BCEWithLogitsLoss(reduction="none", weight=weight)
+        else:
+            self.bce = nn.BCEWithLogitsLoss(reduction="none")
         self.hyp = h
         self.stride = m.stride  # model strides
         self.nc = m.nc  # number of classes
@@ -230,7 +239,7 @@ class v8DetectionLoss:
                 matches = i == j
                 if n := matches.sum():
                     out[j, :n] = targets[matches, 1:]
-            out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
+            out[..., -4:] = xywh2xyxy(out[..., -4:].mul_(scale_tensor))
         return out
 
     def bbox_decode(self, anchor_points: torch.Tensor, pred_dist: torch.Tensor) -> torch.Tensor:
@@ -258,10 +267,23 @@ class v8DetectionLoss:
         imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
         anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
 
+        # Targets (support single-label and multi-label ground truth formats)
+        # MDB is this right?
         # Targets
-        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
-        targets = self.preprocess(targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
-        gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+        #-        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        #+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"], batch["bboxes"]), 1)
+        #        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        #-        gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+        #+        gt_labels, gt_bboxes = targets.split((self.nc, 4), 2)  # cls, xyxy
+        #        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
+
+        cls_tensor = batch["cls"]
+        is_multilabel = cls_tensor.ndim > 1 and cls_tensor.shape[1] > 1
+        cls_part = cls_tensor if is_multilabel else cls_tensor.view(-1, 1)
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), cls_part, batch["bboxes"]), 1)
+        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        split_c = self.nc if is_multilabel else 1
+        gt_labels, gt_bboxes = targets.split((split_c, 4), 2)  # cls, xyxy
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
 
         # Pboxes
@@ -495,14 +517,25 @@ class v8PoseLoss(v8DetectionLoss):
         super().__init__(model)
         self.kpt_shape = model.model[-1].kpt_shape
         self.bce_pose = nn.BCEWithLogitsLoss()
+        self.nc_main = 5
         is_pose = self.kpt_shape == [17, 3]
+        is_facepose = self.kpt_shape == [22, 3]
+        is_faceposebox = self.kpt_shape == [23, 3]
         nkpt = self.kpt_shape[0]  # number of keypoints
-        sigmas = torch.from_numpy(OKS_SIGMA).to(self.device) if is_pose else torch.ones(nkpt, device=self.device) / nkpt
+        if is_pose:
+            sigmas = torch.from_numpy(OKS_SIGMA).to(self.device)
+        elif is_facepose:
+            sigmas = torch.from_numpy(FACEPOSE_SIGMA).to(self.device)
+        elif is_faceposebox:
+            sigmas = torch.from_numpy(FACEPOSEBOX_SIGMA).to(self.device)
+        else:
+            sigmas = torch.ones(nkpt, device=self.device) / nkpt
+
         self.keypoint_loss = KeypointLoss(sigmas=sigmas)
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate the total loss and detach it for pose estimation."""
-        loss = torch.zeros(5, device=self.device)  # box, cls, dfl, kpt_location, kpt_visibility
+        loss = torch.zeros(6, device=self.device)  # box, cls, dfl, kpt_location, kpt_visibility
         feats, pred_kpts = preds if isinstance(preds[0], list) else preds[1]
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * 4, self.nc), 1
@@ -518,11 +551,16 @@ class v8PoseLoss(v8DetectionLoss):
         anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
 
         # Targets
+         # MDB again, is this right?, see above
         batch_size = pred_scores.shape[0]
         batch_idx = batch["batch_idx"].view(-1, 1)
-        targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"]), 1)
-        targets = self.preprocess(targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
-        gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+        cls_tensor = batch["cls"]
+        is_multilabel = cls_tensor.ndim > 1 and cls_tensor.shape[1] > 1
+        cls_part = cls_tensor if is_multilabel else cls_tensor.view(-1, 1)
+        targets = torch.cat((batch_idx, cls_part, batch["bboxes"]), 1)
+        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        split_c = self.nc if is_multilabel else 1
+        gt_labels, gt_bboxes = targets.split((split_c, 4), 2)  # cls, xyxy
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
 
         # Pboxes
@@ -542,7 +580,29 @@ class v8PoseLoss(v8DetectionLoss):
 
         # Cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[3] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        #loss[3] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        #loss[5] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+
+        # 1. Flatten to (N, nc)
+        pred = pred_scores.view(-1, self.nc)
+        tgt  = target_scores.view(-1, self.nc)
+
+        # 2. Split proper vs. attribute classes
+        pred_main = pred[:, :self.nc_main]      # (N, 5)
+        tgt_main  = tgt[:, :self.nc_main]
+        pred_attr = pred[:, self.nc_main:]      # (N, nc-5)
+        tgt_attr  = tgt[:, self.nc_main:]
+
+        # 3. Compute per-group BCE (no reduction)
+        loss_main_terms = self.bce(pred_main.to(dtype), tgt_main.to(dtype))  # shape (N,5)
+        loss_attr_terms = self.bce(pred_attr.to(dtype), tgt_attr.to(dtype))  # shape (N,nc-5)
+
+        # 4. Normalize each by its own positive count
+        #    (clamp to 1 to avoid divide-zero if a batch has no positives of that group)
+        pos_main = tgt_main.sum().clamp(min=1)
+        pos_attr = tgt_attr.sum().clamp(min=1)
+        loss[3] = loss_main_terms.sum() / pos_main  # main classes
+        loss[5] = loss_attr_terms.sum()  / pos_attr  # attr
 
         # Bbox loss
         if fg_mask.sum():
@@ -563,6 +623,7 @@ class v8PoseLoss(v8DetectionLoss):
         loss[2] *= self.hyp.kobj  # kobj gain
         loss[3] *= self.hyp.cls  # cls gain
         loss[4] *= self.hyp.dfl  # dfl gain
+        loss[5] *= self.hyp.attr  # attr gain
 
         return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
 
