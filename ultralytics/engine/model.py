@@ -294,7 +294,7 @@ class Model(torch.nn.Module):
 
         if str(weights).rpartition(".")[-1] == "pt":
             self.model, self.ckpt = load_checkpoint(weights)
-            self.task = self.model.task
+            self.task = self.model.args["task"] # MDB fixme!! self.model.task
             self.overrides = self.model.args = self._reset_ckpt_args(self.model.args)
             self.ckpt_path = self.model.pt_path
         else:
