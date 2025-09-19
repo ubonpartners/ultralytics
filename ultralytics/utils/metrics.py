@@ -837,7 +837,11 @@ def ap_per_class(
     tp, conf, pred_cls = tp[i], conf[i], pred_cls[i]
 
     # Find unique classes
-    unique_classes, nt = np.unique(target_cls.nonzero()[1], return_counts=True)
+    #unique_classes, nt = np.unique(target_cls.nonzero()[1], return_counts=True)
+    if target_cls.ndim == 1 or (target_cls.ndim == 2 and target_cls.shape[1] == 1):
+        unique_classes, nt = np.unique(target_cls.astype(int).ravel(), return_counts=True)
+    else:
+        unique_classes, nt = np.unique(np.nonzero(target_cls)[1], return_counts=True)
     nc = unique_classes.shape[0]  # number of classes, number of detections
 
     # Create Precision-Recall curve and compute AP for each class
@@ -1146,7 +1150,14 @@ class DetMetrics(SimpleClass, DataExportMixin):
         )[2:]
         self.box.nc = len(self.names)
         self.box.update(results)
-        self.nt_per_class = np.bincount(stats["target_cls"].astype(int), minlength=len(self.names))
+        #self.nt_per_class = np.bincount(stats["target_cls"].astype(int), minlength=len(self.names))
+        tc = stats["target_cls"]
+        if tc.ndim == 1 or (tc.ndim == 2 and tc.shape[1] == 1):
+            # 1D indices (or 2D single column) → flatten and bincount
+            self.nt_per_class = np.bincount(tc.astype(int).ravel(), minlength=len(self.names))
+        else:
+            # 2D one-hot → per-class counts are column sums
+            self.nt_per_class = tc.astype(int).sum(axis=0)
         self.nt_per_image = np.bincount(stats["target_img"].astype(int), minlength=len(self.names))
         return stats
 
