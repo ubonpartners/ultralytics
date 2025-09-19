@@ -2208,7 +2208,16 @@ class Format:
                 )
             labels["masks"] = masks
         labels["img"] = self._format_img(img)
-        labels["cls"] = torch.from_numpy(cls) if nl else torch.zeros(nl, 1)
+        #labels["cls"] = torch.from_numpy(cls) if nl else torch.zeros(nl, 1)
+        # MDB multilabel fix
+        if nl:
+            labels["cls"] = torch.from_numpy(cls)
+        else:
+            if isinstance(cls, np.ndarray) and cls.ndim == 2 and cls.shape[-1] > 1:
+                C = int(cls.shape[-1])
+                labels["cls"] = torch.zeros((0, C))
+            else:
+                labels["cls"] = torch.zeros((0, 1))
         labels["bboxes"] = torch.from_numpy(instances.bboxes) if nl else torch.zeros((nl, 4))
         if self.return_keypoint:
             labels["keypoints"] = (
