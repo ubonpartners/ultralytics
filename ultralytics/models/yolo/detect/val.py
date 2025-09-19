@@ -150,16 +150,14 @@ class DetectionValidator(BaseValidator):
         new_cls = torch.zeros((len(rows), num_classes), dtype=torch.int)
         new_cls[torch.arange(len(rows)), cols] = 1
         # Replicate the box tensor correspondingly
-        new_bbox = bbox[rows]
+        bbox = bbox[rows]
         cls=new_cls.to(self.device)
-        bbox=new_bbox.to(self.device)
 
         ori_shape = batch["ori_shape"][si]
         imgsz = batch["img"].shape[2:]
         ratio_pad = batch["ratio_pad"][si]
         if cls.shape[0]:
             bbox = ops.xywh2xyxy(bbox) * torch.tensor(imgsz, device=self.device)[[1, 0, 1, 0]]  # target boxes
-            ops.scale_boxes(imgsz, bbox, ori_shape, ratio_pad=ratio_pad)  # native-space labels
         return {
             "cls": cls,
             "bboxes": bbox,

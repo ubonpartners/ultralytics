@@ -188,11 +188,10 @@ class PoseValidator(DetectionValidator):
         kpts = kpts.clone()
         kpts[..., 0] *= w
         kpts[..., 1] *= h
-        kpts = ops.scale_coords(pbatch["imgsz"], kpts, pbatch["ori_shape"], ratio_pad=pbatch["ratio_pad"])
-        pbatch["keypoints"] = kpts
         # multi-label - replicate/expand GT keypoints for any consumers that expect per-class rows
         if "rows" in pbatch:
-            pbatch["kpts"] = kpts[pbatch["rows"]]
+            kpts = kpts[pbatch["rows"]]
+        pbatch["keypoints"] = kpts
         return pbatch
 
     def _process_batch(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> dict[str, np.ndarray]:
