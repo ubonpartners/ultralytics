@@ -77,13 +77,14 @@ class DetectionTrainer(BaseTrainer):
             (Dataset): YOLO dataset object configured for the specified mode.
         """
         gs = max(int(unwrap_model(self.model).stride.max() if self.model else 0), 32)
-        if isinstance(img_path, str):
-            img_path = [img_path]
-        dataset = [
-            build_yolo_dataset(self.args, im_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs)
-            for im_path in img_path
-        ]
-        return YOLOConcatDataset(dataset) if len(dataset) > 1 else dataset[0]
+        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs)
+        #if isinstance(img_path, str):
+        #    img_path = [img_path]
+        #dataset = [
+        #    build_yolo_dataset(self.args, im_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs)
+        #    for im_path in img_path
+        #]
+        #return YOLOConcatDataset(dataset) if len(dataset) > 1 else dataset[0]
 
     def get_dataloader(self, dataset_path: str, batch_size: int = 16, rank: int = 0, mode: str = "train"):
         """
