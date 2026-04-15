@@ -263,7 +263,7 @@ class Results(SimpleClass, DataExportMixin):
         self.names = names
         self.path = path
         self.save_dir = None
-        self._keys = "boxes", "masks", "probs", "keypoints", "obb", "attributes"
+        self._keys = "boxes", "masks", "probs", "keypoints", "obb", "reid_embeddings", "attributes"
 
     def __getitem__(self, idx):
         """Return a Results object for a specific index of inference results.
@@ -305,6 +305,7 @@ class Results(SimpleClass, DataExportMixin):
         probs: torch.Tensor | None = None,
         obb: torch.Tensor | None = None,
         keypoints: torch.Tensor | None = None,
+        reid_embeddings: torch.Tensor | None = None,
         attributes: torch.Tensor | None = None,
     ):
         """Update the Results object with new detection data.
@@ -319,6 +320,7 @@ class Results(SimpleClass, DataExportMixin):
             probs (torch.Tensor | None): A tensor of shape (num_classes,) containing class probabilities.
             obb (torch.Tensor | None): A tensor of shape (N, 7) or (N, 8) containing oriented bounding box coordinates.
             keypoints (torch.Tensor | None): A tensor of shape (N, K, 3) containing keypoints, were K=17 for persons.
+            reid_embeddings (torch.Tensor | None): A tensor of shape (N, emb_dim) with L2-normalised ReID embeddings.
             attributes (torch.Tensor | None): A tensor of shape (N, attr_nc) containing per-detection attribute scores.
 
         Examples:
@@ -336,6 +338,8 @@ class Results(SimpleClass, DataExportMixin):
             self.obb = OBB(obb, self.orig_shape)
         if keypoints is not None:
             self.keypoints = Keypoints(keypoints, self.orig_shape)
+        if reid_embeddings is not None:
+            self.reid_embeddings = reid_embeddings
         if attributes is not None:
             self.attributes = attributes
 

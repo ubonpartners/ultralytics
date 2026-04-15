@@ -58,21 +58,7 @@ class PosePredictor(DetectionPredictor):
             (Results): The result object containing the original image, image path, class names, bounding boxes, and
                 keypoints.
         """
-        # `self.model` is an AutoBackend wrapper at runtime.
-        # For PyTorch weights AutoBackend.model is a PoseModel/DetectionModel instance, whose actual modules live in
-        # `.model` (nn.Sequential). Older code incorrectly assumed `self.model.model[-1]` was valid.
-        backend = self.model
-        pt_model = getattr(backend, "model", backend)
-        head = None
-        try:
-            head = pt_model.model[-1]  # PoseModel/DetectionModel -> nn.Sequential head
-        except Exception:
-            try:
-                head = pt_model[-1]  # last resort if model itself is subscriptable
-            except Exception:
-                head = None
-
-        attr_nc = getattr(head, "attr_nc", 0) if head is not None else 0
+        attr_nc = self._resolve_attr_nc()
         kpt_start = 6 + attr_nc
         result = super().construct_result(pred, img, orig_img, img_path)
         if attr_nc:
@@ -87,3 +73,58 @@ class PosePredictor(DetectionPredictor):
         pred_kpts = ops.scale_coords(img.shape[2:], pred_kpts, orig_img.shape)
         result.update(keypoints=pred_kpts)
         return result
+
+
+class PoseReIDPredictor(PosePredictor):
+    """Predictor that slices PoseReID embeddings from the extra output channels.
+
+    PoseReID appends reid_dim embedding channels to the standard pose output tensor.
+    This predictor strips those channels, stores them in Results.reid_embeddings, and
+    passes the remainder to the standard PosePredictor pipeline.
+    """
+
+    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
+        super().__init__(cfg, overrides, _callbacks)
+        self.args.task = "posereid"
+
+    def _resolve_reid_dim(self, head=None) -> int:
+        """Resolve ReID embedding width from head first, then backend metadata."""
+        head = head if head is not None else self._resolve_head()
+        reid = getattr(head, "reid", None) if head is not None else None
+        for key in ("emb", "emb_dim", "out_dim"):
+            val = getattr(reid, key, None) if reid is not None else None
+            if isinstance(val, int) and val > 0:
+                return val
+        try:
+            return max(int(getattr(self.model, "reid_vector_len", 0) or 0), 0)
+        except Exception:
+            return 0
+
+    def construct_result(self, pred, img, orig_img, img_path):
+        head = self._resolve_head()
+        reid_dim = self._resolve_reid_dim(head=head)
+        if pred.numel():
+            attr_nc = self._resolve_attr_nc(head=head)
+            nk = getattr(head, "nk", 0) if head is not None else 0
+            if not nk:
+                kpt_shape = getattr(self.model, "kpt_shape", None)
+                if isinstance(kpt_shape, (list, tuple)) and len(kpt_shape) >= 2:
+                    nk = int(kpt_shape[0]) * int(kpt_shape[1])
+            # Row-index is only appended in E2E mode (attr_nc > 0). Use an exact shape
+            # check so we don't accidentally strip a reid column in non-E2E mode.
+            has_row_idx = attr_nc > 0 and pred.shape[1] == 6 + attr_nc + nk + reid_dim + 1
+            if has_row_idx:
+                pred = pred[:, :-1]
+
+        # Slice reid embeddings from the tail of the prediction tensor
+        if pred.numel() and reid_dim:
+            reid_emb = pred[:, -reid_dim:]
+            pred = pred[:, :-reid_dim]
+        else:
+            reid_emb = None
+
+        result = super().construct_result(pred, img, orig_img, img_path)
+        if reid_emb is not None:
+            result.update(reid_embeddings=reid_emb)
+        return result
+

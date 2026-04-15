@@ -25,6 +25,8 @@ __all__ = (
     "Classify",
     "Detect",
     "Pose",
+    "PoseReID",
+    "Pose26ReID",
     "RTDETRDecoder",
     "Segment",
     "YOLOEDetect",
@@ -164,7 +166,7 @@ class Detect(nn.Module):
         """Concatenates and returns predicted bounding boxes and class probabilities.
 
         cls_head always outputs nc+attr_nc combined. include_attr=False discards the attr
-        slice (available as an opt-in override, but not used by default).
+        slice (used for the o2o path during training to prevent unstable TAL attr gradients).
         """
         attr_nc = int(getattr(self, "attr_nc", 0) or 0)
         if box_head is None or cls_head is None:  # for fused inference
@@ -743,6 +745,171 @@ class Pose(Detect):
             return y
 
 
+class ReIDAdapter(nn.Module):
+    """FiLM-modulated MLP to generate ReID embeddings."""
+
+    def __init__(self, in_dim=575, hidden1=160, hidden2=192, emb=80):
+        super().__init__()
+        self.in_dim = in_dim
+        self.emb = emb
+        self.feat_dim = in_dim - 8
+        self.film = nn.Sequential(nn.Linear(8, 2 * self.feat_dim))
+        self.mlp = nn.Sequential(
+            nn.Linear(self.feat_dim, hidden1),
+            nn.ReLU(),
+            nn.Dropout(0.05),
+            nn.Linear(hidden1, hidden2),
+            nn.ReLU(),
+            nn.Dropout(0.05),
+            nn.Linear(hidden2, emb),
+            nn.LayerNorm(emb),
+        )
+        self.scale = nn.Parameter(torch.tensor(10.0))
+
+    def forward(self, x):
+        feats, scale_code = x[:, : self.feat_dim], x[:, self.feat_dim :]
+        pad_len = 8 - scale_code.shape[1]
+        if pad_len > 0:
+            scale_code = F.pad(scale_code, (0, pad_len))
+        gamma_beta = self.film(scale_code)
+        gamma, beta = gamma_beta.chunk(2, dim=1)
+        feats = feats * (1 + gamma) + beta
+        emb = self.mlp(feats)
+        return F.normalize(emb, p=2, dim=1) * self.scale
+
+
+class PoseReID(Pose):
+    """Pose head with ReID embeddings appended to predictions.
+
+    The ReID adapter consumes a concatenation of per-anchor class scores (from the detection head output)
+    and per-anchor backbone features (padded to a fixed width plus a scale one-hot code). This lets the
+    embedding use both visual features and detection semantics such as attribute logits.
+    """
+
+    CODE_LEN = 8
+    FEAT_WIDTH = 512
+    FEAT_PLUS_CODE = FEAT_WIDTH + CODE_LEN
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reid = ReIDAdapter(in_dim=self.nc + self.attr_nc + self.FEAT_PLUS_CODE)
+
+    def _slice_cls_scores(self, preds, num_anchors):
+        if preds.dim() != 3:
+            raise RuntimeError(f"preds must be 3D, got {tuple(preds.shape)}")
+
+        b = preds.shape[0]
+        score_dim = self.nc + self.attr_nc
+        if preds.shape[-1] == num_anchors:
+            out = preds[:, 4 : 4 + score_dim, :].permute(0, 2, 1)
+        elif preds.shape[1] == num_anchors:
+            out = preds[:, :, 4 : 4 + score_dim]
+        else:
+            raise RuntimeError(
+                f"Cannot infer layout from preds shape {tuple(preds.shape)} with A={num_anchors}. "
+                "Expected A to be either dim=1 or dim=2."
+            )
+        if out.shape != (b, num_anchors, score_dim):
+            raise RuntimeError(
+                f"Sliced class/attr scores wrong shape: {tuple(out.shape)}, expected [{b}, {num_anchors}, {score_dim}]"
+            )
+        return out
+
+    @staticmethod
+    def _has_anchor_layout(preds, num_anchors):
+        return preds.dim() == 3 and (preds.shape[-1] == num_anchors or preds.shape[1] == num_anchors)
+
+    def _append_reid(self, x, preds):
+        all_scales = []
+        for i, feat in enumerate(x):
+            b, c, h, w = feat.shape
+            n = h * w
+            flat = feat.permute(0, 2, 3, 1).reshape(b, n, c)
+            if c < self.FEAT_WIDTH:
+                flat = torch.cat([flat, flat.new_zeros(b, n, self.FEAT_WIDTH - c)], dim=2)
+            else:
+                flat = flat[:, :, : self.FEAT_WIDTH]
+            code = flat.new_zeros(b, n, self.CODE_LEN)
+            code[:, :, min(i, self.CODE_LEN - 1)] = 1
+            all_scales.append(torch.cat([flat, code], dim=2))
+
+        feats = torch.cat(all_scales, dim=1)
+        b, a, ftot = feats.shape
+        flat_feats = feats.reshape(b * a, ftot)
+        cls_scores = self._slice_cls_scores(preds, a)
+        cls_scores_flat = cls_scores.reshape(b * a, self.nc + self.attr_nc)
+        reid_input = torch.cat([cls_scores_flat, flat_feats], dim=1)
+
+        emb = self.reid(reid_input)
+        emb = emb.view(b, a, -1).permute(0, 2, 1)
+        return torch.cat([preds, emb], dim=1)
+
+    def postprocess(self, preds: torch.Tensor) -> torch.Tensor:
+        """Post-process predictions and preserve appended ReID embeddings."""
+        emb_dim = int(getattr(getattr(self, "reid", None), "emb", 0) or 0)
+        base_dim = 4 + self.nc + self.attr_nc + self.nk
+        if emb_dim <= 0 or preds.shape[-1] < base_dim + emb_dim:
+            return super().postprocess(preds)
+
+        has_row_idx = self.attr_nc > 0 and preds.shape[-1] == (base_dim + emb_dim + 1)
+        core = preds[..., :-1] if has_row_idx else preds
+
+        reid = core[..., base_dim : base_dim + emb_dim]
+        core_no_reid = core[..., :base_dim]
+
+        # Recreate top-k gather used by parent postprocess so ReID vectors align 1:1.
+        _, _, idx = self.get_topk_index(core_no_reid[..., 4 : 4 + self.nc], self.max_det)
+        reid_gathered = reid.gather(dim=1, index=idx.repeat(1, 1, emb_dim))
+
+        out = super().postprocess(core_no_reid)
+        if self.attr_nc > 0:
+            return torch.cat([out[..., :-1], reid_gathered, out[..., -1:]], dim=-1)
+        return torch.cat([out, reid_gathered], dim=-1)
+
+    def forward(self, x):
+        xc = [y.clone() for y in x]
+        if self.export and self.end2end:
+            # Export bypasses the non-export tuple return, so rebuild the one2one
+            # inference path here and append ReID before postprocess.
+            x_detach = [xi.detach() for xi in xc]
+            one2one = self.forward_head(x_detach, **self.one2one)
+            if self.attr_nc > 0 and self.cv3 is not None:
+                bs = xc[0].shape[0]
+                one2one["attr"] = torch.cat(
+                    [self.cv3[i](xc[i]).view(bs, self.nc + self.attr_nc, -1)[:, self.nc:] for i in range(self.nl)],
+                    dim=-1,
+                )
+            raw = self._inference(one2one)
+            combined_anchor = self._append_reid(x, raw)
+            return self.postprocess(combined_anchor.permute(0, 2, 1))
+        r = super().forward(xc)
+        if self.training:
+            return r
+
+        if self.export:
+            preds = r
+            indices = None
+        else:
+            preds, indices = r
+
+        if isinstance(indices, dict):
+            # End-to-end runtime path: build anchor-aligned predictions from one2one
+            # and append ReID before postprocess, so ReID survives top-k selection.
+            raw = self._inference(indices["one2one"] if self.end2end else indices)
+            combined_anchor = self._append_reid(x, raw)
+            out = self.postprocess(combined_anchor.permute(0, 2, 1)) if self.end2end else combined_anchor
+            return out if self.export else (out, indices)
+
+        num_anchors = int(sum(f.shape[2] * f.shape[3] for f in x))
+        if not self._has_anchor_layout(preds, num_anchors):
+            # Some export/e2e paths provide postprocessed [B, max_det, C] tensors rather
+            # than anchor-aligned predictions. ReID append requires anchor alignment.
+            return preds if self.export else (preds, indices)
+
+        combined_pred = self._append_reid(x, preds)
+        return combined_pred if self.export else (combined_pred, indices)
+
+
 class Pose26(Pose):
     """YOLO26 Pose head for keypoints models.
 
@@ -880,6 +1047,124 @@ class Pose26(Pose):
             y[:, 0::ndim] = (y[:, 0::ndim] + self.anchors[0]) * self.strides
             y[:, 1::ndim] = (y[:, 1::ndim] + self.anchors[1]) * self.strides
             return y
+
+
+class Pose26ReID(Pose26):
+    """Pose26 head with ReID embeddings appended to predictions."""
+
+    CODE_LEN = 8
+    FEAT_WIDTH = 512
+    FEAT_PLUS_CODE = FEAT_WIDTH + CODE_LEN
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reid = ReIDAdapter(in_dim=self.nc + self.attr_nc + self.FEAT_PLUS_CODE)
+
+    def _slice_cls_scores(self, preds, num_anchors):
+        if preds.dim() != 3:
+            raise RuntimeError(f"preds must be 3D, got {tuple(preds.shape)}")
+        b = preds.shape[0]
+        score_dim = self.nc + self.attr_nc
+        if preds.shape[-1] == num_anchors:
+            out = preds[:, 4 : 4 + score_dim, :].permute(0, 2, 1)
+        elif preds.shape[1] == num_anchors:
+            out = preds[:, :, 4 : 4 + score_dim]
+        else:
+            raise RuntimeError(
+                f"Cannot infer layout from preds shape {tuple(preds.shape)} with A={num_anchors}. "
+                "Expected A to be either dim=1 or dim=2."
+            )
+        if out.shape != (b, num_anchors, score_dim):
+            raise RuntimeError(
+                f"Sliced class/attr scores wrong shape: {tuple(out.shape)}, expected [{b}, {num_anchors}, {score_dim}]"
+            )
+        return out
+
+    @staticmethod
+    def _has_anchor_layout(preds, num_anchors):
+        return preds.dim() == 3 and (preds.shape[-1] == num_anchors or preds.shape[1] == num_anchors)
+
+    def _append_reid(self, x, preds):
+        all_scales = []
+        for i, feat in enumerate(x):
+            b, c, h, w = feat.shape
+            n = h * w
+            flat = feat.permute(0, 2, 3, 1).reshape(b, n, c)
+            if c < self.FEAT_WIDTH:
+                flat = torch.cat([flat, flat.new_zeros(b, n, self.FEAT_WIDTH - c)], dim=2)
+            else:
+                flat = flat[:, :, : self.FEAT_WIDTH]
+            code = flat.new_zeros(b, n, self.CODE_LEN)
+            code[:, :, min(i, self.CODE_LEN - 1)] = 1
+            all_scales.append(torch.cat([flat, code], dim=2))
+
+        feats = torch.cat(all_scales, dim=1)
+        b, a, ftot = feats.shape
+        flat_feats = feats.reshape(b * a, ftot)
+        cls_scores = self._slice_cls_scores(preds, a)
+        cls_scores_flat = cls_scores.reshape(b * a, self.nc + self.attr_nc)
+        reid_input = torch.cat([cls_scores_flat, flat_feats], dim=1)
+        emb = self.reid(reid_input)
+        emb = emb.view(b, a, -1).permute(0, 2, 1)
+        return torch.cat([preds, emb], dim=1)
+
+    def postprocess(self, preds: torch.Tensor) -> torch.Tensor:
+        """Post-process predictions and preserve appended ReID embeddings."""
+        emb_dim = int(getattr(getattr(self, "reid", None), "emb", 0) or 0)
+        base_dim = 4 + self.nc + self.attr_nc + self.nk
+        if emb_dim <= 0 or preds.shape[-1] < base_dim + emb_dim:
+            return super().postprocess(preds)
+
+        has_row_idx = self.attr_nc > 0 and preds.shape[-1] == (base_dim + emb_dim + 1)
+        core = preds[..., :-1] if has_row_idx else preds
+
+        reid = core[..., base_dim : base_dim + emb_dim]
+        core_no_reid = core[..., :base_dim]
+
+        _, _, idx = self.get_topk_index(core_no_reid[..., 4 : 4 + self.nc], self.max_det)
+        reid_gathered = reid.gather(dim=1, index=idx.repeat(1, 1, emb_dim))
+
+        out = super().postprocess(core_no_reid)
+        if self.attr_nc > 0:
+            return torch.cat([out[..., :-1], reid_gathered, out[..., -1:]], dim=-1)
+        return torch.cat([out, reid_gathered], dim=-1)
+
+    def forward(self, x):
+        xc = [y.clone() for y in x]
+        if self.export and self.end2end:
+            # Export bypasses the non-export tuple return, so rebuild the one2one
+            # inference path here and append ReID before postprocess.
+            x_detach = [xi.detach() for xi in xc]
+            one2one = self.forward_head(x_detach, **self.one2one)
+            if self.attr_nc > 0 and self.cv3 is not None:
+                bs = xc[0].shape[0]
+                one2one["attr"] = torch.cat(
+                    [self.cv3[i](xc[i]).view(bs, self.nc + self.attr_nc, -1)[:, self.nc:] for i in range(self.nl)],
+                    dim=-1,
+                )
+            raw = self._inference(one2one)
+            combined_anchor = self._append_reid(x, raw)
+            return self.postprocess(combined_anchor.permute(0, 2, 1))
+        r = super().forward(xc)
+        if self.training:
+            return r
+        if self.export:
+            preds = r
+            indices = None
+        else:
+            preds, indices = r
+        if isinstance(indices, dict):
+            raw = self._inference(indices["one2one"] if self.end2end else indices)
+            combined_anchor = self._append_reid(x, raw)
+            out = self.postprocess(combined_anchor.permute(0, 2, 1)) if self.end2end else combined_anchor
+            return out if self.export else (out, indices)
+        num_anchors = int(sum(f.shape[2] * f.shape[3] for f in x))
+        if not self._has_anchor_layout(preds, num_anchors):
+            # Some export/e2e paths provide postprocessed [B, max_det, C] tensors rather
+            # than anchor-aligned predictions. ReID append requires anchor alignment.
+            return preds if self.export else (preds, indices)
+        combined_pred = self._append_reid(x, preds)
+        return combined_pred if self.export else (combined_pred, indices)
 
 
 class Classify(nn.Module):

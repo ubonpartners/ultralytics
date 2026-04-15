@@ -57,6 +57,8 @@ from ultralytics.nn.modules import (
     LRPCHead,
     Pose,
     Pose26,
+    Pose26ReID,
+    PoseReID,
     RepC3,
     RepConv,
     RepNCSPELAN4,
@@ -641,6 +643,21 @@ class PoseModel(DetectionModel):
         base = PoseLoss26 if isinstance(head, Pose26) else v8PoseLoss
         return E2ELoss(self, base) if getattr(self, "end2end", False) else base(self)
 
+
+class PoseReIDModel(DetectionModel):
+    """YOLO pose ReID model."""
+
+    def __init__(self, cfg="yolo26n-posereid.yaml", ch=3, nc=None, data_kpt_shape=(None, None), verbose=True):
+        if not isinstance(cfg, dict):
+            cfg = yaml_model_load(cfg)
+        if any(data_kpt_shape) and list(data_kpt_shape) != list(cfg["kpt_shape"]):
+            LOGGER.info(f"Overriding model.yaml kpt_shape={cfg['kpt_shape']} with kpt_shape={data_kpt_shape}")
+            cfg["kpt_shape"] = data_kpt_shape
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+
+    def init_criterion(self):
+        """Initialize the loss criterion for the PoseReIDModel."""
+        return v8PoseLoss(self)
 
 class ClassificationModel(BaseModel):
     """YOLO classification model.
@@ -1717,12 +1734,14 @@ def parse_model(d, ch, verbose=True):
                 YOLOESegment26,
                 Pose,
                 Pose26,
+                Pose26ReID,
+                PoseReID,
                 OBB,
                 OBB26,
             }
         ):
             # Pose heads use (nc, kpt_shape, attr_nc, reg_max, end2end, ch); YAML only lists [nc, kpt_shape].
-            if m in {Pose, Pose26} and len(args) == 2:
+            if m in {Pose, Pose26, Pose26ReID, PoseReID} and len(args) == 2:
                 args.insert(2, attr_nc_yaml)
             args.extend([reg_max, end2end, [ch[x] for x in f]])
             if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
@@ -1736,6 +1755,8 @@ def parse_model(d, ch, verbose=True):
                 YOLOESegment26,
                 Pose,
                 Pose26,
+                Pose26ReID,
+                PoseReID,
                 OBB,
                 OBB26,
             }:
@@ -1852,6 +1873,8 @@ def guess_model_task(model):
                 return "segment"
             elif isinstance(m, Classify):
                 return "classify"
+            elif isinstance(m, (PoseReID, Pose26ReID)):
+                return "posereid"
             elif isinstance(m, Pose):
                 return "pose"
             elif isinstance(m, OBB):

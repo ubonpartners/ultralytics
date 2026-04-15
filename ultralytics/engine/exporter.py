@@ -502,6 +502,43 @@ class Exporter:
         self.pretty_name = Path(self.model.yaml.get("yaml_file", self.file)).stem.replace("yolo", "YOLO")
         data = model.args["data"] if hasattr(model, "args") and isinstance(model.args, dict) else ""
         description = f"Ultralytics {self.pretty_name} model {f'trained on {data}' if data else ''}"
+        head = model.model[-1] if hasattr(model, "model") and len(model.model) else None
+
+        # Attribute metadata (used by attribute-capable heads and TensorRT runtime fallbacks).
+        attr_nc = int(getattr(head, "attr_nc", 0) or 0)
+        raw_attr_names = getattr(model, "attr_names", None)
+        if raw_attr_names is None:
+            raw_attr_names = getattr(head, "attr_names", None)
+        if isinstance(raw_attr_names, dict):
+            pairs = []
+            for k, v in raw_attr_names.items():
+                try:
+                    idx = int(k)
+                except Exception:
+                    continue
+                pairs.append((idx, str(v)))
+            pairs.sort(key=lambda x: x[0])
+            attr_names = [v for _, v in pairs]
+        elif isinstance(raw_attr_names, (list, tuple)):
+            attr_names = [str(v) for v in raw_attr_names]
+        else:
+            attr_names = []
+        if attr_nc <= 0 and attr_names:
+            attr_nc = len(attr_names)
+        if attr_nc > 0 and not attr_names:
+            attr_names = [f"attr_{i}" for i in range(attr_nc)]
+        if attr_nc > 0 and len(attr_names) > attr_nc:
+            attr_names = attr_names[:attr_nc]
+
+        # ReID embedding metadata (for PoseReID/Pose26ReID TensorRT inference path).
+        reid_vector_len = 0
+        reid = getattr(head, "reid", None)
+        for key in ("emb", "emb_dim", "out_dim"):
+            val = getattr(reid, key, None) if reid is not None else None
+            if isinstance(val, int) and val > 0:
+                reid_vector_len = val
+                break
+
         self.metadata = {
             "description": description,
             "author": "Ultralytics",
@@ -517,10 +554,14 @@ class Exporter:
             "args": {k: v for k, v in self.args if k in fmt_keys},
             "channels": model.yaml.get("channels", 3),
             "end2end": getattr(model, "end2end", False),
+            "nc_attr": attr_nc,
+            "attr_names": attr_names,
         }  # model metadata
+        if reid_vector_len > 0:
+            self.metadata["reid_vector_len"] = reid_vector_len
         if self.dla is not None:
             self.metadata["dla"] = self.dla  # make sure `AutoBackend` uses correct dla device if it has one
-        if model.task == "pose":
+        if model.task in {"pose", "posereid"}:
             self.metadata["kpt_shape"] = model.model[-1].kpt_shape
             if hasattr(model, "kpt_names"):
                 self.metadata["kpt_names"] = model.kpt_names
