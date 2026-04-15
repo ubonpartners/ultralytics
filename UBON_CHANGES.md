@@ -136,10 +136,18 @@ All mix/spatial transforms propagate `labels["attr"]` alongside `labels["cls"]`:
 
 `v8DetectionLoss` gains:
 - `attr_enabled = self.attributes and self.attr_nc > 0`
-- `select_target_attrs(attrs, batch_idx, target_gt_idx, fg_mask)`: uses TAL per-image GT
-  indices to assemble `[B, A, attr_nc]` attribute targets; returns zeros for background
-  anchors
-- Attribute BCE loss: `(bce(pred_attrs, target_attrs) * fg_mask[...,None]).sum() / pos_attr`
+- `assigner_multilabel`: a second `TaskAlignedAssigner` with `num_classes=nc+attr_nc` used
+  when `attr_enabled`. The multilabel path calls `_build_multilabel_gt` to produce a
+  `[B, max_targets, nc+attr_nc]` multi-hot GT tensor; TAL score gathering uses
+  `amax()` over active class channels.
+- `get_assigned_targets_and_loss` branches on `attr_enabled`:
+  - **multilabel path**: assigner_multilabel → split `target_scores_full` into
+    `target_scores_cls` (first `nc` channels) and `target_scores_attr` (last `attr_nc`
+    channels); cls BCE uses cls scores; attr BCE uses attr scores; **bbox loss uses
+    cls-only scores** for weight/normalization (so box gradient is driven by detection
+    quality, independent of attr channel count).
+  - **standard path**: existing single-assigner, class-only BCE.
+- Attribute BCE loss: `bce(pred_attrs, target_scores_attr).sum() / target_scores_attr.sum().clamp(min=1)`
   scaled by `hyp.attr`
 - Loss tensor extended from 3 → 4 slots when `attr_enabled`
 
@@ -364,6 +372,48 @@ See the `reid` repository README for full configuration, dataset loaders, and CL
 
 ---
 
+## Bugs fixed (applied on top of the feature commits)
+
+These bugs were found during review and fixed in `ultralytics/utils/loss.py`:
+
+### 1. GPU-CPU sync in loss normalisation (×4)
+
+`max(tensor.item(), 1)` and `max(tensor, 1)` called `.item()` or compared directly, forcing
+a GPU→CPU synchronisation every forward pass and breaking CUDA graph capture.
+
+Fixed by replacing all four occurrences with `.clamp(min=1)`:
+```python
+# Before
+target_scores_sum = max(target_scores.sum(), 1)
+# After
+target_scores_sum = target_scores.sum().clamp(min=1)
+```
+
+### 2. Dead `select_target_attrs` method
+
+A `select_target_attrs(attrs, batch_idx, target_gt_idx, fg_mask)` method was defined but
+never called anywhere in the codebase. The actual multilabel path uses the `assigner_multilabel`
+path (TAL assigns multi-hot targets directly via `_build_multilabel_gt`). The dead method was
+removed.
+
+### 3. `bbox_loss` weight used full `nc+attr_nc` scores in multilabel path
+
+In the multilabel branch, `target_scores` and `target_scores_sum` were computed from
+`target_scores_full` (shape `[..., nc+attr_nc]`). `BboxLoss` sums over the last dimension,
+so the per-anchor weight included all `attr_nc` channels, coupling box gradient magnitude to
+the number of active attributes. Fixed to use `target_scores_cls` (first `nc` channels only)
+for bbox loss weight and normalisation — semantically cleaner; numerically equivalent in
+expectation since the extra attr channels cancel across a balanced batch.
+
+### 4. Missing `self.class_weights` initialisation
+
+The `v8DetectionLoss.__init__` had `self.class_weights = getattr(model, "class_weights", None)`
+removed from a prior refactor, but the usage at lines 500–501 (multilabel path) and 536–537
+(standard path) remained, causing `AttributeError` for any model with per-class weights.
+Restored the initialisation (and the `.to(device).view(1, 1, -1)` reshape) in `__init__`.
+
+---
+
 ## Known limitations / future work
 
 1. **`YOLOAttributeDataset.cache_labels`** duplicates most of `YOLODataset.cache_labels`.
@@ -432,7 +482,7 @@ See the `reid` repository README for full configuration, dataset loaders, and CL
 | `ultralytics/models/yolo/obb/predict.py` | Predict: attr minor |
 | `ultralytics/models/yolo/obb/val.py` | Val: attr minor |
 | `ultralytics/models/nas/val.py` | Val: nc fix |
-| `ultralytics/utils/loss.py` | Loss: attr BCE; select_target_attrs; FACEPOSE sigmas import |
+| `ultralytics/utils/loss.py` | Loss: attr BCE; multilabel assigner path; FACEPOSE sigmas import; bug fixes |
 | `ultralytics/utils/metrics.py` | Metrics: FACEPOSE/FACEPOSEBOX sigmas; multi-label ConfusionMatrix |
 | `ultralytics/utils/nms.py` | NMS: return_idxs E2E row-index path |
 | `ultralytics/utils/tal.py` | TAL: multi-label score gathering and target assignment |

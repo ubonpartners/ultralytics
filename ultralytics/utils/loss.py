@@ -375,6 +375,10 @@ class v8DetectionLoss:
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
+        self.class_weights = getattr(model, "class_weights", None)
+        if self.class_weights is not None:
+            self.class_weights = self.class_weights.to(device).view(1, 1, -1)
+
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets by converting to tensor format and scaling coordinates."""
         nl, ne = targets.shape
