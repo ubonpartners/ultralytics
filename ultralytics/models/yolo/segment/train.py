@@ -55,7 +55,9 @@ class SegmentationTrainer(yolo.detect.DetectionTrainer):
             >>> model = trainer.get_model(cfg="yolo26n-seg.yaml")
             >>> model = trainer.get_model(weights="yolo26n-seg.pt", verbose=False)
         """
-        model = SegmentationModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
+        model = SegmentationModel(
+            cfg, nc=self.data["nc"], attr_nc=self.args.attr_nc, ch=self.data["channels"], verbose=verbose and RANK == -1
+        )
         if weights:
             model.load(weights)
 
@@ -63,7 +65,10 @@ class SegmentationTrainer(yolo.detect.DetectionTrainer):
 
     def get_validator(self):
         """Return an instance of SegmentationValidator for validation of YOLO model."""
-        self.loss_names = "box_loss", "seg_loss", "cls_loss", "dfl_loss", "sem_loss"
+        if self.args.attributes:
+            self.loss_names = "box_loss", "seg_loss", "cls_loss", "dfl_loss", "sem_loss", "attr_loss"
+        else:
+            self.loss_names = "box_loss", "seg_loss", "cls_loss", "dfl_loss", "sem_loss"
         return yolo.segment.SegmentationValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )

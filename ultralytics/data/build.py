@@ -17,7 +17,7 @@ from PIL import Image
 from torch.utils.data import Dataset, dataloader, distributed
 
 from ultralytics.cfg import IterableSimpleNamespace
-from ultralytics.data.dataset import GroundingDataset, YOLODataset, YOLOMultiModalDataset
+from ultralytics.data.dataset import GroundingDataset, YOLOAttributeDataset, YOLODataset, YOLOMultiModalDataset
 from ultralytics.data.loaders import (
     LOADERS,
     LoadImagesAndVideos,
@@ -29,7 +29,7 @@ from ultralytics.data.loaders import (
     autocast_list,
 )
 from ultralytics.data.utils import IMG_FORMATS, VID_FORMATS
-from ultralytics.utils import RANK, colorstr
+from ultralytics.utils import LOGGER, RANK, colorstr
 from ultralytics.utils.checks import check_file
 from ultralytics.utils.torch_utils import TORCH_2_0
 
@@ -232,7 +232,29 @@ def build_yolo_dataset(
     multi_modal: bool = False,
 ) -> Dataset:
     """Build and return a YOLO dataset based on configuration parameters."""
-    dataset = YOLOMultiModalDataset if multi_modal else YOLODataset
+    # Use data YAML as fallback for attribute settings so v10-style dataset yamls work even if not in train overrides
+    attributes = getattr(cfg, "attributes", None)
+    if attributes is None or (attributes is False and data.get("attributes")):
+        attributes = bool(data.get("attributes", False))
+    attr_nc = getattr(cfg, "attr_nc", None)
+    if attr_nc is None or (attr_nc == 0 and data.get("attr_nc", 0) > 0):
+        attr_nc = int(data.get("attr_nc", 0))
+    attr_label_format = getattr(cfg, "attr_label_format", None) or str(data.get("attr_label_format", "combined")).lower()
+    # If config has attr_nc and split format but no explicit attributes key, enable attribute dataset
+    if not attributes and attr_nc > 0 and attr_label_format == "split":
+        attributes = True
+
+    val_subsample = int(data.get("subsample", 1) or 1) if mode == "val" else 1
+    if mode == "val" and val_subsample > 1:
+        LOGGER.info(f"Using validation subsample stride={val_subsample} (keeping every {val_subsample}th image).")
+
+    if attributes:
+        LOGGER.info("Using attribute dataset.")
+        dataset = YOLOAttributeDataset
+    elif multi_modal:
+        dataset = YOLOMultiModalDataset
+    else:
+        dataset = YOLODataset
     return dataset(
         img_path=img_path,
         imgsz=cfg.imgsz,
@@ -249,6 +271,10 @@ def build_yolo_dataset(
         classes=cfg.classes,
         data=data,
         fraction=cfg.fraction if mode == "train" else 1.0,
+        sample_stride=val_subsample,
+        attributes=attributes,
+        attr_nc=attr_nc,
+        attr_label_format=attr_label_format,
     )
 
 

@@ -218,6 +218,7 @@ CFG_INT_KEYS = frozenset(
         "close_mosaic",
         "mask_ratio",
         "max_det",
+        "attr_nc",
         "vid_stride",
         "line_width",
         "nbs",
@@ -226,6 +227,7 @@ CFG_INT_KEYS = frozenset(
 )
 CFG_BOOL_KEYS = frozenset(
     {  # boolean-only arguments
+        "attributes",
         "save",
         "exist_ok",
         "verbose",

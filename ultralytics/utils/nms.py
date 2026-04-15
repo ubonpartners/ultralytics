@@ -67,6 +67,17 @@ def non_max_suppression(
         output = [pred[pred[:, 4] > conf_thres][:max_det] for pred in prediction]
         if classes is not None:
             output = [pred[(pred[:, 5:6] == classes).any(1)] for pred in output]
+        if return_idxs:
+            keepi = []
+            stripped = []
+            for pred in output:
+                if pred.shape[1] > 6:
+                    keepi.append(pred[:, -1].long())
+                    stripped.append(pred[:, :-1])
+                else:
+                    keepi.append(torch.arange(pred.shape[0], device=pred.device))
+                    stripped.append(pred)
+            return stripped, keepi
         return output
 
     bs = prediction.shape[0]  # batch size (BCN, i.e. 1,84,6300)

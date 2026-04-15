@@ -793,10 +793,13 @@ class Mosaic(BaseMixTransform):
         if not mosaic_labels:
             return {}
         cls = []
+        attrs = []
         instances = []
         imgsz = self.imgsz * 2  # mosaic imgsz
         for labels in mosaic_labels:
             cls.append(labels["cls"])
+            if "attr" in labels:
+                attrs.append(labels["attr"])
             instances.append(labels["instances"])
         # Final labels
         final_labels = {
@@ -807,9 +810,13 @@ class Mosaic(BaseMixTransform):
             "instances": Instances.concatenate(instances, axis=0),
             "mosaic_border": self.border,
         }
+        if attrs:
+            final_labels["attr"] = np.concatenate(attrs, 0)
         final_labels["instances"].clip(imgsz, imgsz)
         good = final_labels["instances"].remove_zero_area_boxes()
         final_labels["cls"] = final_labels["cls"][good]
+        if "attr" in final_labels:
+            final_labels["attr"] = final_labels["attr"][good]
         if "texts" in mosaic_labels[0]:
             final_labels["texts"] = mosaic_labels[0]["texts"]
         return final_labels
@@ -870,6 +877,8 @@ class MixUp(BaseMixTransform):
         labels["img"] = (labels["img"] * r + labels2["img"] * (1 - r)).astype(np.uint8)
         labels["instances"] = Instances.concatenate([labels["instances"], labels2["instances"]], axis=0)
         labels["cls"] = np.concatenate([labels["cls"], labels2["cls"]], 0)
+        if "attr" in labels and "attr" in labels2:
+            labels["attr"] = np.concatenate([labels["attr"], labels2["attr"]], 0)
         return labels
 
 
@@ -983,6 +992,8 @@ class CutMix(BaseMixTransform):
         instances2.add_padding(x1, y1)
 
         labels["cls"] = np.concatenate([labels["cls"], labels2["cls"][indexes2]], axis=0)
+        if "attr" in labels and "attr" in labels2:
+            labels["attr"] = np.concatenate([labels["attr"], labels2["attr"][indexes2]], axis=0)
         labels["instances"] = Instances.concatenate([labels["instances"], instances2], axis=0)
         return labels
 
@@ -1295,6 +1306,8 @@ class RandomPerspective:
         )
         labels["instances"] = new_instances[i]
         labels["cls"] = cls[i]
+        if "attr" in labels:
+            labels["attr"] = labels["attr"][i]
         labels["img"] = img
         labels["resized_shape"] = img.shape[:2]
         return labels
@@ -1741,6 +1754,7 @@ class CopyPaste(BaseMixTransform):
         if "mosaic_border" not in labels1:
             im = im.copy()  # avoid modifying original non-mosaic image
         cls = labels1["cls"]
+        attr = labels1.get("attr", None)
         h, w = im.shape[:2]
         instances = labels1.pop("instances")
         instances.convert_bbox(format="xyxy")
@@ -1758,6 +1772,8 @@ class CopyPaste(BaseMixTransform):
         indexes = indexes[sorted_idx]
         for j in indexes[: round(self.p * n)]:
             cls = np.concatenate((cls, labels2.get("cls", cls)[[j]]), axis=0)
+            if attr is not None and "attr" in labels2:
+                attr = np.concatenate((attr, labels2["attr"][[j]]), axis=0)
             instances = Instances.concatenate((instances, instances2[[j]]), axis=0)
             cv2.drawContours(im_new, instances2.segments[[j]].astype(np.int32), -1, 1, cv2.FILLED)
 
@@ -1769,6 +1785,8 @@ class CopyPaste(BaseMixTransform):
 
         labels1["img"] = im
         labels1["cls"] = cls
+        if attr is not None:
+            labels1["attr"] = attr
         labels1["instances"] = instances
         return labels1
 
@@ -1870,11 +1888,17 @@ class Albumentations:
                 [
                     A.Blur(p=0.01),
                     A.MedianBlur(p=0.01),
+                    A.MotionBlur(p=0.01),
                     A.ToGray(p=0.01),
                     A.CLAHE(p=0.01),
-                    A.RandomBrightnessContrast(p=0.0),
-                    A.RandomGamma(p=0.0),
-                    A.ImageCompression(quality_range=(75, 100), p=0.0),
+                    A.RandomBrightnessContrast(p=0.01),
+                    A.RandomGamma(p=0.01),
+                    A.ISONoise(p=0.005),
+                    A.ChromaticAberration(p=0.005),
+                    A.RandomRain(p=0.005),
+                    A.RandomFog(p=0.005),
+                    A.RandomSunFlare(p=0.005),
+                    A.ImageCompression(quality_range=(30, 100), p=0.01),
                 ]
                 if transforms is None
                 else transforms
@@ -1883,7 +1907,7 @@ class Albumentations:
             # Compose transforms
             self.contains_spatial = any(transform.__class__.__name__ in spatial_transforms for transform in T)
             self.transform = (
-                A.Compose(T, bbox_params=A.BboxParams(format="yolo", label_fields=["class_labels"]))
+                A.Compose(T, bbox_params=A.BboxParams(format="yolo", label_fields=["class_labels", "attr_labels"]))
                 if self.contains_spatial
                 else A.Compose(T)
             )
@@ -1935,15 +1959,22 @@ class Albumentations:
 
         if self.contains_spatial:
             cls = labels["cls"]
+            attr = labels.get("attr", None)
             if len(cls):
                 labels["instances"].convert_bbox("xywh")
                 labels["instances"].normalize(*im.shape[:2][::-1])
                 bboxes = labels["instances"].bboxes
                 # TODO: add supports of segments and keypoints
-                new = self.transform(image=im, bboxes=bboxes, class_labels=cls)  # transformed
+                if attr is not None:
+                    attr_labels = attr.tolist() if isinstance(attr, np.ndarray) else attr
+                else:
+                    attr_labels = [[] for _ in range(len(cls))]
+                new = self.transform(image=im, bboxes=bboxes, class_labels=cls, attr_labels=attr_labels)  # transformed
                 if len(new["class_labels"]) > 0:  # skip update if no bbox in new im
                     labels["img"] = new["image"]
                     labels["cls"] = np.array(new["class_labels"]).reshape(-1, 1)
+                    if attr is not None and "attr_labels" in new:
+                        labels["attr"] = np.array(new["attr_labels"], dtype=np.float32)
                     bboxes = np.array(new["bboxes"], dtype=np.float32)
                 labels["instances"].update(bboxes=bboxes)
         else:
@@ -2050,6 +2081,7 @@ class Format:
         img = labels.pop("img")
         h, w = img.shape[:2]
         cls = labels.pop("cls")
+        attr = labels.pop("attr", None)
         instances = labels.pop("instances")
         instances.convert_bbox(format=self.bbox_format)
         instances.denormalize(w, h)
@@ -2080,7 +2112,11 @@ class Format:
             labels["masks"] = masks
             labels["sem_masks"] = sem_masks.float()
         labels["img"] = self._format_img(img)
-        labels["cls"] = torch.from_numpy(cls) if nl else torch.zeros(nl, 1)
+        labels["cls"] = torch.from_numpy(cls)
+        if attr is not None:
+            if not isinstance(attr, np.ndarray):
+                attr = np.array(attr, dtype=np.float32)
+            labels["attr"] = torch.from_numpy(attr)
         labels["bboxes"] = torch.from_numpy(instances.bboxes) if nl else torch.zeros((nl, 4))
         if self.return_keypoint:
             labels["keypoints"] = (
@@ -2360,6 +2396,8 @@ class RandomLoadText:
             valid_idx[i] = True
             new_cls.append([label2ids[label]])
         labels["instances"] = labels["instances"][valid_idx]
+        if "attr" in labels:
+            labels["attr"] = labels["attr"][valid_idx]
         labels["cls"] = np.array(new_cls)
 
         # Randomly select one prompt when there's more than one prompts

@@ -597,7 +597,15 @@ class PoseModel(DetectionModel):
         >>> results = model.predict(image_tensor)
     """
 
-    def __init__(self, cfg="yolo26n-pose.yaml", ch=3, nc=None, data_kpt_shape=(None, None), verbose=True):
+    def __init__(
+        self,
+        cfg="yolo26n-pose.yaml",
+        ch=3,
+        nc=None,
+        data_kpt_shape=(None, None),
+        attr_nc=0,
+        verbose=True,
+    ):
         """Initialize Ultralytics YOLO Pose model.
 
         Args:
@@ -605,18 +613,33 @@ class PoseModel(DetectionModel):
             ch (int): Number of input channels.
             nc (int, optional): Number of classes.
             data_kpt_shape (tuple): Shape of keypoints data.
+            attr_nc (int): Number of attribute logits; merged into yaml when > 0 (requires attribute-capable head).
             verbose (bool): Whether to display model information.
         """
         if not isinstance(cfg, dict):
             cfg = yaml_model_load(cfg)  # load model YAML
+        else:
+            cfg = deepcopy(cfg)
         if any(data_kpt_shape) and list(data_kpt_shape) != list(cfg["kpt_shape"]):
             LOGGER.info(f"Overriding model.yaml kpt_shape={cfg['kpt_shape']} with kpt_shape={data_kpt_shape}")
             cfg["kpt_shape"] = data_kpt_shape
+        ac = int(attr_nc or 0)
+        if ac > 0:
+            cfg["attr_nc"] = ac
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+        if ac > 0 and not int(getattr(self.model[-1], "attr_nc", 0) or 0):
+            LOGGER.warning(
+                "attr_nc>0 was requested but the loaded pose head has no attribute outputs. "
+                "Use a checkpoint/YAML built with the attribute head, or set attributes=False / attr_nc=0."
+            )
 
     def init_criterion(self):
         """Initialize the loss criterion for the PoseModel."""
-        return E2ELoss(self, PoseLoss26) if getattr(self, "end2end", False) else v8PoseLoss(self)
+        # Pose26 head uses a different keypoint decode than Pose (YOLO11-style).
+        # Use PoseLoss26 whenever the head is Pose26 (regardless of end2end), otherwise use v8PoseLoss.
+        head = self.model[-1]
+        base = PoseLoss26 if isinstance(head, Pose26) else v8PoseLoss
+        return E2ELoss(self, base) if getattr(self, "end2end", False) else base(self)
 
 
 class ClassificationModel(BaseModel):
@@ -1522,6 +1545,10 @@ def load_checkpoint(weight, device=None, inplace=True, fuse=False):
     model.task = getattr(model, "task", guess_model_task(model))
     if not hasattr(model, "stride"):
         model.stride = torch.tensor([32.0])
+    # Default attr_names for older checkpoints trained with attribute head but saved before attr_names was persisted
+    attr_nc = getattr(model, "yaml", {}).get("attr_nc", 0)
+    if attr_nc and (not getattr(model, "attr_names", None) or len(getattr(model, "attr_names", [])) != attr_nc):
+        model.attr_names = [f"attr_{i}" for i in range(attr_nc)]
 
     model = (model.fuse() if fuse and hasattr(model, "fuse") else model).eval().to(device)  # model in eval mode
 
@@ -1555,6 +1582,7 @@ def parse_model(d, ch, verbose=True):
     max_channels = float("inf")
     nc, act, scales, end2end = (d.get(x) for x in ("nc", "activation", "scales", "end2end"))
     reg_max = d.get("reg_max", 16)
+    attr_nc_yaml = int(d.get("attr_nc") or 0)
     depth, width, kpt_shape = (d.get(x, 1.0) for x in ("depth_multiple", "width_multiple", "kpt_shape"))
     scale = d.get("scale")
     if scales:
@@ -1693,10 +1721,24 @@ def parse_model(d, ch, verbose=True):
                 OBB26,
             }
         ):
+            # Pose heads use (nc, kpt_shape, attr_nc, reg_max, end2end, ch); YAML only lists [nc, kpt_shape].
+            if m in {Pose, Pose26} and len(args) == 2:
+                args.insert(2, attr_nc_yaml)
             args.extend([reg_max, end2end, [ch[x] for x in f]])
             if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
+            if m in {
+                Detect,
+                YOLOEDetect,
+                Segment,
+                Segment26,
+                YOLOESegment,
+                YOLOESegment26,
+                Pose,
+                Pose26,
+                OBB,
+                OBB26,
+            }:
                 m.legacy = legacy
         elif m is v10Detect:
             args.append([ch[x] for x in f])

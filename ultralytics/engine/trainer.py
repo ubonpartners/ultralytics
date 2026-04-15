@@ -185,6 +185,21 @@ class BaseTrainer:
         with torch_distributed_zero_first(LOCAL_RANK):  # avoid auto-downloading dataset multiple times
             self.data = self.get_dataset()
 
+        # Sync attribute-head settings from data YAML to args so build_yolo_dataset uses YOLOAttributeDataset
+        if "attributes" in self.data:
+            self.args.attributes = bool(self.data["attributes"])
+        if "attr_nc" in self.data:
+            self.args.attr_nc = int(self.data["attr_nc"])
+        if "attr_label_format" in self.data:
+            self.args.attr_label_format = str(self.data["attr_label_format"]).lower()
+        # Keep loss gating consistent with build_yolo_dataset(), which auto-enables attributes for split labels.
+        if (
+            not getattr(self.args, "attributes", False)
+            and int(getattr(self.args, "attr_nc", 0) or 0) > 0
+            and str(getattr(self.args, "attr_label_format", "combined")).lower() == "split"
+        ):
+            self.args.attributes = True
+
         self.ema = None
 
         # Optimization utils init
@@ -1016,8 +1031,11 @@ class BaseTrainer:
                     g[1][fullname] = param
                 else:  # weight (with decay)
                     g[0][fullname] = param
+        backbone_lr_scale = getattr(self.args, "backbone_lr_scale", None)
         if not use_muon:
-            g = [x.values() for x in g[:3]]  # convert to list of params
+            if backbone_lr_scale is None:
+                g = [x.values() for x in g[:3]]  # convert to list of params
+            # else: keep name-keyed dicts so we can split backbone vs head below
 
         optimizers = {"Adam", "Adamax", "AdamW", "NAdam", "RAdam", "RMSProp", "SGD", "MuSGD", "auto"}
         name = {x.lower(): x for x in optimizers}.get(name.lower())
@@ -1045,13 +1063,51 @@ class BaseTrainer:
 
             # higher lr for certain parameters in MuSGD when funetuning
             pattern = re.compile(r"(?=.*23)(?=.*cv3)|proto\.semseg")
+            # backbone: layers 0-22 (backbone + neck); head starts at layer 23
+            backbone_pattern = re.compile(r"^model\.\d+\.|^\d+\.")
+
+            def _is_backbone(k):
+                m = re.match(r"^(?:model\.)?(\d+)\.", k)
+                return m is not None and int(m.group(1)) <= 22
+
             g_ = []  # new param groups
             for x in g:
                 p = x.pop("params")
                 p1 = [v for k, v in p.items() if pattern.search(k)]
-                p2 = [v for k, v in p.items() if not pattern.search(k)]
-                g_.extend([{"params": p1, **x, "lr": lr * 3}, {"params": p2, **x}])
+                p2_all = {k: v for k, v in p.items() if not pattern.search(k)}
+                if backbone_lr_scale is not None:
+                    p2_bb = [v for k, v in p2_all.items() if _is_backbone(k)]
+                    p2_hd = [v for k, v in p2_all.items() if not _is_backbone(k)]
+                    g_.extend([
+                        {"params": p1, **x, "lr": lr * 3},
+                        {"params": p2_bb, **x, "lr": lr * backbone_lr_scale},
+                        {"params": p2_hd, **x},
+                    ])
+                else:
+                    g_.extend([{"params": p1, **x, "lr": lr * 3}, {"params": list(p2_all.values()), **x}])
             g = g_
+        elif backbone_lr_scale is not None:
+            # non-MuSGD with backbone_lr_scale: split each group into backbone vs head
+            import re
+
+            def _is_backbone(k):
+                m = re.match(r"^(?:model\.)?(\d+)\.", k)
+                return m is not None and int(m.group(1)) <= 22
+
+            g_ = []
+            for x in g:
+                p = x.pop("params")
+                p_bb = [v for k, v in p.items() if _is_backbone(k)]
+                p_hd = [v for k, v in p.items() if not _is_backbone(k)]
+                g_.extend([
+                    {"params": p_bb, **x, "lr": lr * backbone_lr_scale},
+                    {"params": p_hd, **x},
+                ])
+            g = g_
+        if backbone_lr_scale is not None:
+            LOGGER.info(
+                f"{colorstr('backbone_lr_scale:')} {backbone_lr_scale} — backbone/neck layers 0-22 use lr={lr * backbone_lr_scale:.6g}"
+            )
         optimizer = getattr(optim, name, partial(MuSGD, muon=muon, sgd=sgd))(params=g)
 
         LOGGER.info(

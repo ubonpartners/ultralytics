@@ -63,9 +63,11 @@ def generate_ddp_file(trainer: BaseTrainer) -> str:
     content = f"""
 # Ultralytics Multi-GPU training temp file (should be automatically deleted after use)
 from pathlib import Path, PosixPath  # For model arguments stored as Path instead of str
+from torch.distributed.elastic.multiprocessing.errors import record
 overrides = {overrides}
 
-if __name__ == "__main__":
+@record
+def main():
     from {module} import {name}
     from ultralytics.utils import DEFAULT_CFG_DICT
 
@@ -78,7 +80,10 @@ if __name__ == "__main__":
     cfg.update(save_dir='')   # handle the extra key 'save_dir'
     trainer = {name}(cfg=cfg, overrides=overrides)
     trainer.args.model = "{getattr(trainer.hub_session, "model_url", trainer.args.model)}"
-    results = trainer.train()
+    return trainer.train()
+
+if __name__ == "__main__":
+    main()
 """
     (USER_CONFIG_DIR / "DDP").mkdir(exist_ok=True)
     with tempfile.NamedTemporaryFile(

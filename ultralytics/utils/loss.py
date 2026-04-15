@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ultralytics.utils.metrics import OKS_SIGMA, RLE_WEIGHT
+from ultralytics.utils.metrics import FACEPOSEBOX_SIGMA, FACEPOSE_SIGMA, OKS_SIGMA, RLE_WEIGHT
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import autocast
@@ -156,9 +156,9 @@ class BboxLoss(nn.Module):
 class RLELoss(nn.Module):
     """Residual Log-Likelihood Estimation Loss.
 
-    Attributes:
-        size_average (bool): Option to average the loss by the batch_size.
+    Args:
         use_target_weight (bool): Option to use weighted loss.
+        size_average (bool): Option to average the loss by the batch_size.
         residual (bool): Option to add L1 loss and let the flow learn the residual error distribution.
 
     References:
@@ -341,6 +341,9 @@ class v8DetectionLoss:
         m = model.model[-1]  # Detect() module
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
         self.hyp = h
+        self.attributes = getattr(h, "attributes", False)
+        self.attr_nc = int(getattr(h, "attr_nc", 0) or 0)
+        self.attr_enabled = self.attributes and self.attr_nc > 0
         self.stride = m.stride  # model strides
         self.nc = m.nc  # number of classes
         self.no = m.nc + m.reg_max * 4
@@ -349,11 +352,6 @@ class v8DetectionLoss:
 
         self.use_dfl = m.reg_max > 1
 
-        # Class weights for handling imbalanced datasets
-        self.class_weights = getattr(model, "class_weights", None)
-        if self.class_weights is not None:
-            self.class_weights = self.class_weights.to(device).view(1, 1, -1)
-
         self.assigner = TaskAlignedAssigner(
             topk=tal_topk,
             num_classes=self.nc,
@@ -361,6 +359,18 @@ class v8DetectionLoss:
             beta=6.0,
             stride=self.stride.tolist(),
             topk2=tal_topk2,
+        )
+        self.assigner_multilabel = (
+            TaskAlignedAssigner(
+                topk=tal_topk,
+                num_classes=self.nc + self.attr_nc,
+                alpha=0.5,
+                beta=6.0,
+                stride=self.stride.tolist(),
+                topk2=tal_topk2,
+            )
+            if self.attr_enabled
+            else None
         )
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
@@ -392,15 +402,48 @@ class v8DetectionLoss:
             # pred_dist = (pred_dist.view(b, a, c // 4, 4).softmax(2) * self.proj.type(pred_dist.dtype).view(1, 1, -1, 1)).sum(2)
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
+    def _build_multilabel_gt(self, batch: dict[str, Any], batch_size: int, max_targets: int, dtype: torch.dtype) -> torch.Tensor:
+        """Build multilabel gt tensor [b, max_targets, nc+attr_nc] from split cls/attr batch format."""
+        gt = torch.zeros(batch_size, max_targets, self.nc + self.attr_nc, device=self.device, dtype=dtype)
+        if max_targets == 0:
+            return gt
+
+        batch_idx = batch["batch_idx"].view(-1).to(self.device).long()
+        if batch_idx.numel() == 0:
+            return gt
+
+        cls = batch["cls"].view(-1).to(self.device).long().clamp_(0, self.nc - 1)
+        attrs = batch["attr"].to(self.device).to(dtype) if "attr" in batch else None
+
+        offsets = torch.zeros(batch_size + 1, dtype=torch.long, device=self.device)
+        offsets.scatter_add_(0, batch_idx + 1, torch.ones_like(batch_idx))
+        offsets = offsets.cumsum(0)
+        within_idx = torch.arange(batch_idx.numel(), device=self.device) - offsets[batch_idx]
+        valid = within_idx < max_targets
+        if not valid.any():
+            return gt
+
+        batch_idx = batch_idx[valid]
+        within_idx = within_idx[valid]
+        cls = cls[valid]
+
+        gt[batch_idx, within_idx, cls] = 1.0
+        if attrs is not None and attrs.numel():
+            gt[batch_idx, within_idx, self.nc :] = attrs[valid, : self.attr_nc]
+        return gt
+
     def get_assigned_targets_and_loss(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> tuple:
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size and return foreground mask and
         target indices.
         """
-        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        loss = torch.zeros(4 if self.attr_enabled else 3, device=self.device)  # box, cls, dfl, attr?
         pred_distri, pred_scores = (
             preds["boxes"].permute(0, 2, 1).contiguous(),
             preds["scores"].permute(0, 2, 1).contiguous(),
         )
+        pred_attrs = preds.get("attr")
+        if pred_attrs is not None:
+            pred_attrs = pred_attrs.permute(0, 2, 1).contiguous()
         anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
 
         dtype = pred_scores.dtype
@@ -416,22 +459,83 @@ class v8DetectionLoss:
         # Pboxes
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
 
-        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
-            pred_scores.detach().sigmoid(),
-            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
-            anchor_points * stride_tensor,
-            gt_labels,
-            gt_bboxes,
-            mask_gt,
-        )
+        has_attr_head = pred_attrs is not None
+        has_attr_batch = "attr" in batch
+        use_multilabel_attr = self.attr_enabled and has_attr_head and has_attr_batch
+        if use_multilabel_attr:
+            assert self.attr_nc > 0, "Invalid attr setup: `attr_nc` must be > 0 when attr outputs/labels are present."
+            assert self.assigner_multilabel is not None, "Internal error: multilabel assigner not initialised."
 
-        target_scores_sum = max(target_scores.sum(), 1)
+            # Multilabel-compat path: assign using combined class+attribute logits and labels.
+            pred_scores_full = torch.cat((pred_scores, pred_attrs), dim=-1)
+            gt_labels_full = self._build_multilabel_gt(batch, batch_size, gt_bboxes.shape[1], dtype)
 
-        # Cls loss with optional class weighting
-        bce_loss = self.bce(pred_scores, target_scores.to(dtype))  # (bs, num_anchors, nc)
-        if self.class_weights is not None:
-            bce_loss *= self.class_weights
-        loss[1] = bce_loss.sum() / target_scores_sum  # BCE
+            # Sanity-check that attr labels are non-trivially zero (fires once on first batch with data).
+            if not getattr(self, "_attr_gt_checked", False):
+                attr_gt_sum = gt_labels_full[..., self.nc :].sum().item()
+                if attr_gt_sum == 0:
+                    import warnings
+
+                    warnings.warn(
+                        f"[loss] gt_labels_full attr channels are ALL ZERO for this batch "
+                        f"(nc={self.nc}, attr_nc={self.attr_nc}). "
+                        "Check that batch['attr'] contains non-zero values and that "
+                        "_build_multilabel_gt is filling the attr columns correctly.",
+                        stacklevel=2,
+                    )
+                self._attr_gt_checked = True
+
+            _, target_bboxes, target_scores_full, fg_mask, target_gt_idx = self.assigner_multilabel(
+                pred_scores_full.detach().sigmoid(),
+                (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+                anchor_points * stride_tensor,
+                gt_labels_full,
+                gt_bboxes,
+                mask_gt,
+            )
+
+            target_scores_cls = target_scores_full[..., : self.nc]
+            target_scores_attr = target_scores_full[..., self.nc :]
+            bce_loss_cls = self.bce(pred_scores, target_scores_cls.to(dtype))
+            if self.class_weights is not None:
+                bce_loss_cls *= self.class_weights
+            loss[1] = bce_loss_cls.sum() / target_scores_cls.sum().clamp(min=1)
+            loss[3] = self.bce(pred_attrs, target_scores_attr.to(dtype)).sum() / target_scores_attr.sum().clamp(min=1)
+
+            # Use cls-only scores for bbox loss weight/normalization so box gradient is driven
+            # by detection quality, not attr count per object (they cancel in expectation anyway).
+            target_scores = target_scores_cls
+            target_scores_sum = target_scores_cls.sum().clamp(min=1)
+        else:
+            if (
+                self.attr_enabled
+                and has_attr_batch
+                and not has_attr_head
+                and not bool(getattr(self.hyp, "end2end", False))
+                and not getattr(self, "_attr_head_warned", False)
+            ):
+                import warnings
+
+                warnings.warn(
+                    "[loss] Attributes are enabled and labels are present, but this prediction branch has no "
+                    "`preds['attr']` logits. Falling back to class-only assignment for this branch.",
+                    stacklevel=2,
+                )
+                self._attr_head_warned = True
+            _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
+                pred_scores.detach().sigmoid(),
+                (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+                anchor_points * stride_tensor,
+                gt_labels,
+                gt_bboxes,
+                mask_gt,
+            )
+
+            target_scores_sum = target_scores.sum().clamp(min=1)
+            bce_loss = self.bce(pred_scores, target_scores.to(dtype))
+            if self.class_weights is not None:
+                bce_loss *= self.class_weights
+            loss[1] = bce_loss.sum() / target_scores_sum  # BCE
 
         # Bbox loss
         if fg_mask.sum():
@@ -450,11 +554,18 @@ class v8DetectionLoss:
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
+        if self.attr_enabled:
+            loss[3] *= self.hyp.attr  # attr gain
         return (
-            (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor),
+            (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor, target_scores, pred_scores),
             loss,
             loss.detach(),
         )  # loss(box, cls, dfl)
+
+    @property
+    def attr_loss_idx(self) -> int | None:
+        """Index of the attribute loss element in this loss vector, or None if not enabled."""
+        return 3 if self.attr_enabled else None
 
     def parse_output(
         self, preds: dict[str, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]]
@@ -471,7 +582,7 @@ class v8DetectionLoss:
         return self.loss(self.parse_output(preds), batch)
 
     def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Calculate detection loss using assigned targets."""
+        """A wrapper for get_assigned_targets_and_loss and parse_output."""
         batch_size = preds["boxes"].shape[0]
         loss, loss_detach = self.get_assigned_targets_and_loss(preds, batch)[1:]
         return loss * batch_size, loss_detach
@@ -489,14 +600,18 @@ class v8SegmentationLoss(v8DetectionLoss):
     def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate and return the combined loss for detection and segmentation."""
         pred_masks, proto = preds["mask_coefficient"].permute(0, 2, 1).contiguous(), preds["proto"]
-        loss = torch.zeros(5, device=self.device)  # box, seg, cls, dfl, semseg
+        loss = torch.zeros(6 if self.attr_enabled else 5, device=self.device)  # box, seg, cls, dfl, sem, attr?
         if isinstance(proto, tuple) and len(proto) == 2:
             proto, pred_semseg = proto
         else:
             pred_semseg = None
-        (fg_mask, target_gt_idx, target_bboxes, _, _), det_loss, _ = self.get_assigned_targets_and_loss(preds, batch)
+        (fg_mask, target_gt_idx, target_bboxes, _, _, _, _), det_loss, _ = self.get_assigned_targets_and_loss(
+            preds, batch
+        )
         # NOTE: re-assign index for consistency for now. Need to be removed in the future.
         loss[0], loss[2], loss[3] = det_loss[0], det_loss[1], det_loss[2]
+        if self.attr_enabled and len(det_loss) > 3:
+            loss[-1] = det_loss[3]
 
         batch_size, _, mask_h, mask_w = proto.shape  # batch size, number of masks, mask height, mask width
         if fg_mask.sum():
@@ -544,7 +659,7 @@ class v8SegmentationLoss(v8DetectionLoss):
                 loss[4] += (pred_semseg * 0).sum()
 
         loss[1] *= self.hyp.box  # seg gain
-        return loss * batch_size, loss.detach()  # loss(box, seg, cls, dfl, semseg)
+        return loss * batch_size, loss.detach()  # loss(box, seg, cls, dfl, semseg[, attr])
 
     @staticmethod
     def single_mask_loss(
@@ -643,19 +758,28 @@ class v8PoseLoss(v8DetectionLoss):
         self.kpt_shape = model.model[-1].kpt_shape
         self.bce_pose = nn.BCEWithLogitsLoss()
         is_pose = self.kpt_shape == [17, 3]
+        is_facepose = self.kpt_shape == [22, 3]
+        is_faceposebox = self.kpt_shape == [23, 3]
         nkpt = self.kpt_shape[0]  # number of keypoints
-        sigmas = torch.from_numpy(OKS_SIGMA).to(self.device) if is_pose else torch.ones(nkpt, device=self.device) / nkpt
+        if is_pose:
+            sigmas = torch.from_numpy(OKS_SIGMA).to(self.device)
+        elif is_facepose:
+            sigmas = torch.from_numpy(FACEPOSE_SIGMA).to(self.device)
+        elif is_faceposebox:
+            sigmas = torch.from_numpy(FACEPOSEBOX_SIGMA).to(self.device)
+        else:
+            sigmas = torch.ones(nkpt, device=self.device) / nkpt
         self.keypoint_loss = KeypointLoss(sigmas=sigmas)
 
     def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate the total loss and detach it for pose estimation."""
         pred_kpts = preds["kpts"].permute(0, 2, 1).contiguous()
-        loss = torch.zeros(5, device=self.device)  # box, kpt_location, kpt_visibility, cls, dfl
-        (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor), det_loss, _ = (
+        loss = torch.zeros(6 if self.attr_enabled else 5, device=self.device)  # box, pose, kobj, cls, dfl, attr?
+        (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor, target_scores, pred_scores), det_loss, _ = (
             self.get_assigned_targets_and_loss(preds, batch)
         )
         # NOTE: re-assign index for consistency for now. Need to be removed in the future.
-        loss[0], loss[3], loss[4] = det_loss[0], det_loss[1], det_loss[2]
+        loss[0], loss[4] = det_loss[0], det_loss[2]
 
         batch_size = pred_kpts.shape[0]
         imgsz = torch.tensor(preds["feats"][0].shape[2:], device=self.device, dtype=pred_kpts.dtype) * self.stride[0]
@@ -663,7 +787,7 @@ class v8PoseLoss(v8DetectionLoss):
         # Pboxes
         pred_kpts = self.kpts_decode(anchor_points, pred_kpts.view(batch_size, -1, *self.kpt_shape))  # (b, h*w, 17, 3)
 
-        # Keypoint loss
+        # Bbox loss
         if fg_mask.sum():
             keypoints = batch["keypoints"].to(self.device).float().clone()
             keypoints[..., 0] *= imgsz[1]
@@ -679,8 +803,15 @@ class v8PoseLoss(v8DetectionLoss):
                 pred_kpts,
             )
 
+        loss[3] = det_loss[1]
+        if self.attr_enabled and len(det_loss) > 3:
+            loss[5] = det_loss[3]
+
         loss[1] *= self.hyp.pose  # pose gain
         loss[2] *= self.hyp.kobj  # kobj gain
+        # NOTE: loss[3] (cls) and loss[4] (dfl) are taken directly from det_loss which
+        # already has hyp.cls and hyp.dfl applied inside get_assigned_targets_and_loss.
+        # Do NOT re-apply them here — that would double the effective gain.
 
         return loss * batch_size, loss.detach()  # loss(box, pose, kobj, cls, dfl)
 
@@ -808,17 +939,40 @@ class PoseLoss26(v8PoseLoss):
                 torch.from_numpy(RLE_WEIGHT).to(self.device) if is_pose else torch.ones(nkpt, device=self.device)
             )
 
+    @property
+    def attr_loss_idx(self) -> int | None:
+        """Index of the attribute loss element in this loss vector, or None if not enabled."""
+        if not self.attr_enabled:
+            return None
+        return 6 if self.rle_loss is not None else 5
+
+    @staticmethod
+    def kpts_decode(anchor_points: torch.Tensor, pred_kpts: torch.Tensor) -> torch.Tensor:
+        """Decode keypoints for YOLO26 Pose26 head in feature-map (stride) units.
+
+        YOLO26 Pose26 head decodes keypoints as:
+            (raw_xy + anchor_xy) * stride
+
+        Loss operates in stride units (GT keypoints are divided by stride_tensor), so we decode as:
+            raw_xy + anchor_xy
+        """
+        y = pred_kpts.clone()
+        y[..., 0] += anchor_points[:, [0]]
+        y[..., 1] += anchor_points[:, [1]]
+        return y
+
     def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate the total loss and detach it for pose estimation."""
         pred_kpts = preds["kpts"].permute(0, 2, 1).contiguous()
         loss = torch.zeros(
-            6 if self.rle_loss else 5, device=self.device
-        )  # box, kpt_location, kpt_visibility, cls, dfl[, rle]
-        (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor), det_loss, _ = (
+            (8 if self.rle_loss else 7) if self.attr_enabled else (7 if self.rle_loss else 6),
+            device=self.device,
+        )  # box, pose, kobj, cls, dfl, rle?, attr?
+        (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor, target_scores, pred_scores), det_loss, _ = (
             self.get_assigned_targets_and_loss(preds, batch)
         )
         # NOTE: re-assign index for consistency for now. Need to be removed in the future.
-        loss[0], loss[3], loss[4] = det_loss[0], det_loss[1], det_loss[2]
+        loss[0], loss[4] = det_loss[0], det_loss[2]
 
         batch_size = pred_kpts.shape[0]
         imgsz = torch.tensor(preds["feats"][0].shape[2:], device=self.device, dtype=pred_kpts.dtype) * self.stride[0]
@@ -832,7 +986,7 @@ class PoseLoss26(v8PoseLoss):
 
         pred_kpts = self.kpts_decode(anchor_points, pred_kpts)
 
-        # Keypoint loss
+        # Bbox loss
         if fg_mask.sum():
             keypoints = batch["keypoints"].to(self.device).float().clone()
             keypoints[..., 0] *= imgsz[1]
@@ -852,27 +1006,27 @@ class PoseLoss26(v8PoseLoss):
             if self.rle_loss is not None:
                 loss[5] = keypoints_loss[2]
 
+        loss[3] = det_loss[1]
+        if self.attr_enabled and len(det_loss) > 3:
+            attr_idx = 6 if self.rle_loss is not None else 5
+            loss[attr_idx] = det_loss[3]
+
         loss[1] *= self.hyp.pose  # pose gain
         loss[2] *= self.hyp.kobj  # kobj gain
+        # NOTE: loss[3] (cls) and loss[4] (dfl) are taken directly from det_loss which
+        # already has hyp.cls and hyp.dfl applied inside get_assigned_targets_and_loss.
+        # Do NOT re-apply them here — that would double the effective gain.
         if self.rle_loss is not None:
             loss[5] *= self.hyp.rle  # rle gain
 
-        return loss * batch_size, loss.detach()  # loss(box, kpt_location, kpt_visibility, cls, dfl[, rle])
-
-    @staticmethod
-    def kpts_decode(anchor_points: torch.Tensor, pred_kpts: torch.Tensor) -> torch.Tensor:
-        """Decode predicted keypoints to image coordinates."""
-        y = pred_kpts.clone()
-        y[..., 0] += anchor_points[:, [0]]
-        y[..., 1] += anchor_points[:, [1]]
-        return y
+        return loss * batch_size, loss.detach()  # loss(box, cls, dfl, kpt_location, kpt_visibility)
 
     def calculate_rle_loss(self, pred_kpt: torch.Tensor, gt_kpt: torch.Tensor, kpt_mask: torch.Tensor) -> torch.Tensor:
         """Calculate the RLE (Residual Log-likelihood Estimation) loss for keypoints.
 
         Args:
-            pred_kpt (torch.Tensor): Predicted kpts with sigma, shape (N, num_keypoints, kpts_dim) where kpts_dim >= 4.
-            gt_kpt (torch.Tensor): Ground truth keypoints, shape (N, num_keypoints, kpts_dim).
+            pred_kpt (torch.Tensor): Predicted keypoints with sigma, shape (N, kpts_dim) where kpts_dim >= 4.
+            gt_kpt (torch.Tensor): Ground truth keypoints, shape (N, kpts_dim).
             kpt_mask (torch.Tensor): Mask for valid keypoints, shape (N, num_keypoints).
 
         Returns:
@@ -954,7 +1108,6 @@ class PoseLoss26(v8PoseLoss):
 
             if self.rle_loss is not None and (pred_kpt.shape[-1] == 4 or pred_kpt.shape[-1] == 5):
                 rle_loss = self.calculate_rle_loss(pred_kpt, gt_kpt, kpt_mask)
-                rle_loss = rle_loss.clamp(min=0)
             if pred_kpt.shape[-1] == 3 or pred_kpt.shape[-1] == 5:
                 kpts_obj_loss = self.bce_pose(pred_kpt[..., 2], kpt_mask.float())  # keypoint obj loss
 
@@ -1014,7 +1167,7 @@ class v8OBBLoss(v8DetectionLoss):
             preds["angle"].permute(0, 2, 1).contiguous(),
         )
         anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
-        batch_size = pred_angle.shape[0]  # batch size
+        batch_size = pred_angle.shape[0]  # batch size, number of masks, mask height, mask width
 
         dtype = pred_scores.dtype
         imgsz = torch.tensor(preds["feats"][0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
@@ -1108,15 +1261,12 @@ class v8OBBLoss(v8DetectionLoss):
         """Calculate oriented angle loss.
 
         Args:
-            pred_bboxes (torch.Tensor): Predicted bounding boxes with shape [N, 5] (x, y, w, h, theta).
-            target_bboxes (torch.Tensor): Target bounding boxes with shape [N, 5] (x, y, w, h, theta).
-            fg_mask (torch.Tensor): Foreground mask indicating valid predictions.
-            weight (torch.Tensor): Loss weights for each prediction.
-            target_scores_sum (torch.Tensor): Sum of target scores for normalization.
-            lambda_val (int): Controls the sensitivity to aspect ratio.
-
-        Returns:
-            (torch.Tensor): The calculated angle loss.
+            pred_bboxes: [N, 5] (x, y, w, h, theta).
+            target_bboxes: [N, 5] (x, y, w, h, theta).
+            fg_mask: Foreground mask indicating valid predictions.
+            weight: Loss weights for each prediction.
+            target_scores_sum: Sum of target scores for normalization.
+            lambda_val: control the sensitivity to aspect ratio.
         """
         w_gt = target_bboxes[..., 2]
         h_gt = target_bboxes[..., 3]
@@ -1161,6 +1311,12 @@ class E2ELoss:
         """Initialize E2ELoss with one-to-many and one-to-one detection losses using the provided model."""
         self.one2many = loss_fn(model, tal_topk=10)
         self.one2one = loss_fn(model, tal_topk=7, tal_topk2=1)
+        # Give the one2one path its own independent copy of flow_model so that extreme
+        # errors from a randomly-initialised one2one keypoint head (e.g. when training
+        # with freeze and no pose e2e init source) cannot destabilise the one2many flow_model.
+        if getattr(self.one2one, "flow_model", None) is not None:
+            import copy
+            self.one2one.flow_model = copy.deepcopy(self.one2many.flow_model)
         self.updates = 0
         self.total = 1.0
         # init gain
@@ -1176,7 +1332,16 @@ class E2ELoss:
         one2many, one2one = preds["one2many"], preds["one2one"]
         loss_one2many = self.one2many.loss(one2many, batch)
         loss_one2one = self.one2one.loss(one2one, batch)
-        return loss_one2many[0] * self.o2m + loss_one2one[0] * self.o2o, loss_one2one[1]
+        # Scale all o2m losses uniformly (including attr) by self.o2m.
+        # o2o attr loss is always 0 (include_attr=False), so attrs only get o2m signal.
+        # Keeping attr at the same o2m scale as cls/box/dfl preserves the gradient
+        # ratio in cv3's shared intermediate layers, matching non-e2e balance.
+        # The total attr gradient decays with o2m, but this is preferable to the
+        # ~10x gradient distortion that caused attr/cls imbalance within cv3 and
+        # degraded TAL target assignment quality for attributes.
+        combined = loss_one2many[0] * self.o2m + loss_one2one[0] * self.o2o
+        display  = loss_one2many[1] * self.o2m + loss_one2one[1] * self.o2o
+        return combined, display
 
     def update(self) -> None:
         """Update the weights for one-to-many and one-to-one losses based on the decay schedule."""

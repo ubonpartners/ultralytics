@@ -51,14 +51,15 @@ class DetectionPredictor(BasePredictor):
             >>> processed_results = predictor.postprocess(preds, img, orig_imgs)
         """
         save_feats = getattr(self, "_feats", None) is not None
+        pred_tensor = preds[0] if isinstance(preds, (tuple, list)) else preds
         preds = nms.non_max_suppression(
-            preds,
+            pred_tensor,
             self.args.conf,
             self.args.iou,
             self.args.classes,
             self.args.agnostic_nms,
             max_det=self.args.max_det,
-            nc=0 if self.args.task == "detect" else len(self.model.names),
+            nc=len(self.model.names),
             end2end=getattr(self.model, "end2end", False),
             rotated=self.args.task == "obb",
             return_idxs=save_feats,
@@ -119,4 +120,22 @@ class DetectionPredictor(BasePredictor):
             (Results): Results object containing the original image, image path, class names, and scaled bounding boxes.
         """
         pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
-        return Results(orig_img, path=img_path, names=self.model.names, boxes=pred[:, :6])
+        backend = self.model
+        pt_model = getattr(backend, "model", backend)
+        head = None
+        try:
+            head = pt_model.model[-1]  # DetectionModel/PoseModel -> nn.Sequential head
+        except Exception:
+            try:
+                head = pt_model[-1]
+            except Exception:
+                head = None
+
+        attr_nc = getattr(head, "attr_nc", 0) if head is not None else 0
+        if attr_nc and pred.shape[1] >= 6 + attr_nc + 1:
+            pred = pred[:, :-1]
+        attributes = pred[:, 6 : 6 + attr_nc] if attr_nc and pred.shape[1] >= 6 + attr_nc else None
+        result = Results(orig_img, path=img_path, names=self.model.names, boxes=pred[:, :6])
+        if attributes is not None:
+            result.update(attributes=attributes)
+        return result

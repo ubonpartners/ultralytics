@@ -71,7 +71,16 @@ class YOLODataset(BaseDataset):
         >>> dataset.get_labels()
     """
 
-    def __init__(self, *args, data: dict | None = None, task: str = "detect", **kwargs):
+    def __init__(
+        self,
+        *args,
+        data: dict | None = None,
+        task: str = "detect",
+        attributes: bool = False,
+        attr_nc: int = 0,
+        attr_label_format: str = "combined",
+        **kwargs,
+    ):
         """Initialize the YOLODataset.
 
         Args:
@@ -85,6 +94,12 @@ class YOLODataset(BaseDataset):
         self.use_obb = task == "obb"
         self.data = data
         assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
+        self.attributes = bool(attributes)
+        self.attr_nc = int(attr_nc or 0)
+        self.attr_label_format = str(attr_label_format or "combined").lower()
+        if self.attributes and self.attr_label_format not in {"combined", "split"}:
+            LOGGER.warning(f"Unknown attr_label_format '{self.attr_label_format}', falling back to 'combined'.")
+            self.attr_label_format = "combined"
         super().__init__(*args, channels=self.data.get("channels", 3), **kwargs)
 
     def cache_labels(self, path: Path = Path("./labels.cache")) -> dict:
@@ -106,6 +121,7 @@ class YOLODataset(BaseDataset):
                 "'kpt_shape' in data.yaml missing or incorrect. Should be a list with [number of "
                 "keypoints, number of dims (2 for x,y or 3 for x,y,visible)], i.e. 'kpt_shape: [17, 3]'"
             )
+        attr_len = self.attr_nc if self.attributes and self.attr_label_format == "split" else 0
         with ThreadPool(NUM_THREADS) as pool:
             results = pool.imap(
                 func=verify_image_label,
@@ -118,6 +134,7 @@ class YOLODataset(BaseDataset):
                     repeat(nkpt),
                     repeat(ndim),
                     repeat(self.single_cls),
+                    repeat(attr_len),
                 ),
             )
             pbar = TQDM(results, desc=desc, total=total)
@@ -148,7 +165,9 @@ class YOLODataset(BaseDataset):
             LOGGER.info("\n".join(msgs))
         if nf == 0:
             LOGGER.warning(f"{self.prefix}No labels found in {path}. {HELP_URL}")
-        x["hash"] = get_hash(self.label_files + self.im_files)
+        # Include attribute format in hash so cache is invalidated when attr_nc/format changes (e.g. v10 vs v9)
+        base_hash = get_hash(self.label_files + self.im_files)
+        x["hash"] = f"{base_hash}.attr_{int(self.attributes)}_{self.attr_nc}_{self.attr_label_format}"
         x["results"] = nf, nm, ne, nc, len(self.im_files)
         x["msgs"] = msgs  # warnings
         if x["labels"]:
@@ -165,10 +184,12 @@ class YOLODataset(BaseDataset):
         """
         self.label_files = img2label_paths(self.im_files)
         cache_path = Path(self.label_files[0]).parent.with_suffix(".cache")
+        base_hash = get_hash(self.label_files + self.im_files)
+        expected_hash = f"{base_hash}.attr_{int(self.attributes)}_{self.attr_nc}_{self.attr_label_format}"
         try:
             cache, exists = load_dataset_cache_file(cache_path), True  # attempt to load a *.cache file
             assert cache["version"] == DATASET_CACHE_VERSION  # matches current version
-            assert cache["hash"] == get_hash(self.label_files + self.im_files)  # identical hash
+            assert cache["hash"] == expected_hash  # identical hash (incl. attribute format)
         except (FileNotFoundError, AssertionError, AttributeError, ModuleNotFoundError):
             cache, exists = self.cache_labels(cache_path), False  # run cache ops
 
@@ -298,7 +319,7 @@ class YOLODataset(BaseDataset):
                 value = torch.stack(value, 0)
             elif k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
-            if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb"}:
+            if k in {"masks", "keypoints", "bboxes", "cls", "attr", "segments", "obb"}:
                 value = torch.cat(value, 0)
             new_batch[k] = value
         new_batch["batch_idx"] = list(new_batch["batch_idx"])
@@ -306,6 +327,133 @@ class YOLODataset(BaseDataset):
             new_batch["batch_idx"][i] += i  # add target image index for build_targets()
         new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
         return new_batch
+
+
+class YOLOAttributeDataset(YOLODataset):
+    """Dataset class for attribute head training (main class + attribute vector)."""
+
+    def _split_combined_labels(self, labels: np.ndarray, main_nc: int) -> tuple[np.ndarray, np.ndarray]:
+        """Split combined multi-hot labels into main class id and attribute vector.
+
+        Args:
+            labels: (n, main_nc + attr_nc) float array; entries > 0 indicate active classes/attrs.
+            main_nc: Number of main detection classes (columns 0..main_nc-1 are class slots).
+
+        Returns:
+            cls_main: (n, 1) float32 array of first-active main-class index (0 if none active).
+            attr:     (n, attr_nc) float32 attribute vector, or (n, 0) if attr_nc==0.
+        """
+        attr = labels[:, main_nc : main_nc + self.attr_nc].astype(np.float32) if self.attr_nc > 0 else np.zeros(
+            (labels.shape[0], 0), dtype=np.float32
+        )
+        active_mask = labels[:, :main_nc] > 0  # (n, main_nc)
+        active_counts = active_mask.sum(axis=1)  # (n,)
+        missing_main = int((active_counts == 0).sum())
+        multi_main = int((active_counts > 1).sum())
+        # argmax returns the first True index per row; for all-zero rows it returns 0 (correct default)
+        cls_main = np.argmax(active_mask, axis=1).astype(np.float32)[:, None]
+        if missing_main:
+            LOGGER.warning(f"{self.prefix}{missing_main} labels missing a main class; defaulting to class 0.")
+        if multi_main:
+            LOGGER.warning(f"{self.prefix}{multi_main} labels have multiple main classes; using first active class.")
+        return cls_main, attr
+
+    def cache_labels(self, path: Path = Path("./labels.cache")) -> dict:
+        """Cache dataset labels, check images and read shapes.
+
+        NOTE: This overrides YOLODataset.cache_labels because the inner per-label processing differs
+        significantly between combined (multi-hot aggregation) and split (column-slice) formats. A future
+        refactor could add a _process_label() hook to the parent to avoid this duplication.
+        """
+        x = {"labels": []}
+        nm, nf, ne, nc, msgs = 0, 0, 0, 0, []  # number missing, found, empty, corrupt, messages
+        desc = f"{self.prefix}Scanning {path.parent / path.stem}..."
+        total = len(self.im_files)
+        nkpt, ndim = self.data.get("kpt_shape", (0, 0))
+        if self.use_keypoints and (nkpt <= 0 or ndim not in {2, 3}):
+            raise ValueError(
+                "'kpt_shape' in data.yaml missing or incorrect. Should be a list with [number of "
+                "keypoints, number of dims (2 for x,y or 3 for x,y,visible)], i.e. 'kpt_shape: [17, 3]'"
+            )
+
+        if self.attributes and self.attr_nc <= 0:
+            LOGGER.warning(f"{self.prefix}attributes enabled but attr_nc=0; attribute vectors will be empty.")
+        main_nc = len(self.data["names"])
+        total_nc = main_nc + max(self.attr_nc, 0)
+        attr_len = self.attr_nc if self.attr_label_format == "split" else 0
+        num_cls = total_nc if self.attr_label_format == "combined" else main_nc
+
+        with ThreadPool(NUM_THREADS) as pool:
+            results = pool.imap(
+                func=verify_image_label,
+                iterable=zip(
+                    self.im_files,
+                    self.label_files,
+                    repeat(self.prefix),
+                    repeat(self.use_keypoints),
+                    repeat(num_cls),
+                    repeat(nkpt),
+                    repeat(ndim),
+                    repeat(self.single_cls),
+                    repeat(attr_len),
+                ),
+            )
+            pbar = TQDM(results, desc=desc, total=total)
+            for im_file, lb, shape, segments, keypoint, nm_f, nf_f, ne_f, nc_f, msg in pbar:
+                nm += nm_f
+                nf += nf_f
+                ne += ne_f
+                nc += nc_f
+                if im_file:
+                    if self.attr_label_format == "combined":
+                        unique_bboxes, fwd_index, indices = np.unique(
+                            lb[:, 1:], axis=0, return_index=True, return_inverse=True
+                        )
+                        num_classes = total_nc
+                        labels = np.zeros((len(unique_bboxes), num_classes))
+                        for i in range(len(unique_bboxes)):
+                            labels[i, lb[indices == i, 0].astype(np.int32)] = 1.0
+                        cls_main, attr = self._split_combined_labels(labels, main_nc)
+
+                        if keypoint is not None:
+                            keypoint2 = keypoint[fwd_index]
+                        else:
+                            keypoint2 = None
+                        bboxes = unique_bboxes
+                        keypoint = keypoint2
+                    else:
+                        cls_main = lb[:, 0:1]
+                        bboxes = lb[:, 1:5]
+                        attr = lb[:, 5 : 5 + attr_len] if attr_len > 0 else np.zeros((len(lb), 0), dtype=np.float32)
+
+                    x["labels"].append(
+                        {
+                            "im_file": im_file,
+                            "shape": shape,
+                            "cls": cls_main,  # n, 1
+                            "attr": attr,  # n, attr_nc
+                            "bboxes": bboxes,  # n, 4
+                            "segments": segments,
+                            "keypoints": keypoint,
+                            "normalized": True,
+                            "bbox_format": "xywh",
+                        }
+                    )
+                if msg:
+                    msgs.append(msg)
+                pbar.desc = f"{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt"
+            pbar.close()
+
+        if msgs:
+            LOGGER.info("\n".join(msgs))
+        if nf == 0:
+            LOGGER.warning(f"{self.prefix}No labels found in {path}. {HELP_URL}")
+        base_hash = get_hash(self.label_files + self.im_files)
+        x["hash"] = f"{base_hash}.attr_{int(self.attributes)}_{self.attr_nc}_{self.attr_label_format}"
+        x["results"] = nf, nm, ne, nc, len(self.im_files)
+        x["msgs"] = msgs  # warnings
+        save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
+        return x
 
 
 class YOLOMultiModalDataset(YOLODataset):

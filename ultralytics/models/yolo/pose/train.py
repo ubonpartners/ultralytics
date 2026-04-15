@@ -74,6 +74,7 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         model = PoseModel(
             cfg,
             nc=self.data["nc"],
+            attr_nc=self.args.attr_nc,
             ch=self.data["channels"],
             data_kpt_shape=self.data["kpt_shape"],
             verbose=verbose and RANK == -1,
@@ -95,9 +96,21 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
 
     def get_validator(self):
         """Return an instance of the PoseValidator class for validation."""
-        self.loss_names = "box_loss", "pose_loss", "kobj_loss", "cls_loss", "dfl_loss"
-        if getattr(unwrap_model(self.model).model[-1], "flow_model", None) is not None:
-            self.loss_names += ("rle_loss",)
+        # Keep loss name ordering consistent with the actual loss tensor ordering.
+        #
+        # PoseLoss26 returns: [box, pose, kobj, cls, dfl, rle, attr?]
+        # v8PoseLoss returns: [box, pose, kobj, cls, dfl, attr?]
+        has_rle = getattr(unwrap_model(self.model).model[-1], "flow_model", None) is not None
+        if self.args.attributes:
+            if has_rle:
+                self.loss_names = "box_loss", "pose_loss", "kobj_loss", "cls_loss", "dfl_loss", "rle_loss", "attr_loss"
+            else:
+                self.loss_names = "box_loss", "pose_loss", "kobj_loss", "cls_loss", "dfl_loss", "attr_loss"
+        else:
+            if has_rle:
+                self.loss_names = "box_loss", "pose_loss", "kobj_loss", "cls_loss", "dfl_loss", "rle_loss"
+            else:
+                self.loss_names = "box_loss", "pose_loss", "kobj_loss", "cls_loss", "dfl_loss"
         return yolo.pose.PoseValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )

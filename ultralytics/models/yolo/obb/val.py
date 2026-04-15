@@ -104,8 +104,16 @@ class OBBValidator(DetectionValidator):
             (list[dict[str, torch.Tensor]]): Processed predictions with angle information concatenated to bboxes.
         """
         preds = super().postprocess(preds)
+        attr_nc = getattr(self.model.model[-1], "attr_nc", 0) if hasattr(self, "model") else 0
         for pred in preds:
-            pred["bboxes"] = torch.cat([pred["bboxes"], pred.pop("extra")], dim=-1)  # concatenate angle
+            extra = pred.pop("extra")
+            ne = getattr(self.model.model[-1], "ne", 1) if hasattr(self, "model") else 1
+            if attr_nc and extra.shape[1] == attr_nc + ne + 1:
+                extra = extra[:, :-1]
+            if attr_nc:
+                pred["attr"] = extra[:, :attr_nc]
+                extra = extra[:, attr_nc:]
+            pred["bboxes"] = torch.cat([pred["bboxes"], extra], dim=-1)  # concatenate angle
         return preds
 
     def _prepare_batch(self, si: int, batch: dict[str, Any]) -> dict[str, Any]:

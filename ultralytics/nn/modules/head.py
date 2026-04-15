@@ -20,7 +20,17 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
+__all__ = (
+    "OBB",
+    "Classify",
+    "Detect",
+    "Pose",
+    "RTDETRDecoder",
+    "Segment",
+    "YOLOEDetect",
+    "YOLOESegment",
+    "v10Detect",
+)
 
 
 class Detect(nn.Module):
@@ -69,39 +79,46 @@ class Detect(nn.Module):
     format = None  # export format
     max_det = 300  # max_det
     agnostic_nms = False
+    attr_nc = 0  # default for legacy checkpoints without serialized attr_nc
     shape = None
     anchors = torch.empty(0)  # init
     strides = torch.empty(0)  # init
     legacy = False  # backward compatibility for v3/v5/v8/v9 models
     xyxy = False  # xyxy or xywh output
 
-    def __init__(self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = ()):
+    def __init__(self, nc: int = 80, attr_nc: int = 0, reg_max=16, end2end=False, ch: tuple = ()):
         """Initialize the YOLO detection layer with specified number of classes and channels.
 
         Args:
             nc (int): Number of classes.
+            attr_nc (int): Extra attribute logits (separate head); 0 disables.
             reg_max (int): Maximum number of DFL channels.
             end2end (bool): Whether to use end-to-end NMS-free detection.
             ch (tuple): Tuple of channel sizes from backbone feature maps.
         """
         super().__init__()
         self.nc = nc  # number of classes
+        self.attr_nc = int(attr_nc or 0)
         self.nl = len(ch)  # number of detection layers
         self.reg_max = reg_max  # DFL channels (ch[0] // 16 to scale 4/8/12/16/20 for n/s/m/l/x)
-        self.no = nc + self.reg_max * 4  # number of outputs per anchor
+        self.no = nc + self.attr_nc + self.reg_max * 4  # number of outputs per anchor
         self.stride = torch.zeros(self.nl)  # strides computed during build
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
         self.cv2 = nn.ModuleList(
             nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
         )
+        # cv3 always outputs nc+attr_nc combined. Both e2e and non-e2e share this format.
+        # For e2e, the o2o path uses one2one_cv3 (a deepcopy) but suppresses attr
+        # during training (include_attr=False) so o2o TAL does not train attributes.
+        cv3_out = self.nc + (self.attr_nc or 0)
         self.cv3 = (
-            nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
+            nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, cv3_out, 1)) for x in ch)
             if self.legacy
             else nn.ModuleList(
                 nn.Sequential(
                     nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
                     nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
-                    nn.Conv2d(c3, self.nc, 1),
+                    nn.Conv2d(c3, cv3_out, 1),
                 )
                 for x in ch
             )
@@ -119,8 +136,13 @@ class Detect(nn.Module):
 
     @property
     def one2one(self):
-        """Returns the one-to-one head components."""
-        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3)
+        """Returns the one-to-one head components.
+
+        include_attr=False suppresses attribute output during training so the o2o TAL
+        (topk=1, unstable anchors early in training) does not receive attr gradient.
+        Attrs are trained exclusively via the o2m path (topk=10), matching non-e2e behaviour.
+        """
+        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3, include_attr=False)
 
     @property
     def end2end(self):
@@ -133,15 +155,34 @@ class Detect(nn.Module):
         self._end2end = value
 
     def forward_head(
-        self, x: list[torch.Tensor], box_head: torch.nn.Module = None, cls_head: torch.nn.Module = None
+        self,
+        x: list[torch.Tensor],
+        box_head: torch.nn.Module = None,
+        cls_head: torch.nn.Module = None,
+        include_attr: bool = True,
     ) -> dict[str, torch.Tensor]:
-        """Concatenates and returns predicted bounding boxes and class probabilities."""
+        """Concatenates and returns predicted bounding boxes and class probabilities.
+
+        cls_head always outputs nc+attr_nc combined. include_attr=False discards the attr
+        slice (available as an opt-in override, but not used by default).
+        """
+        attr_nc = int(getattr(self, "attr_nc", 0) or 0)
         if box_head is None or cls_head is None:  # for fused inference
             return dict()
         bs = x[0].shape[0]  # batch size
         boxes = torch.cat([box_head[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
-        scores = torch.cat([cls_head[i](x[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
-        return dict(boxes=boxes, scores=scores, feats=x)
+        if attr_nc > 0:
+            cls_out = torch.cat(
+                [cls_head[i](x[i]).view(bs, self.nc + attr_nc, -1) for i in range(self.nl)], dim=-1
+            )
+            scores, attrs = cls_out.split([self.nc, attr_nc], dim=1)
+            preds = dict(boxes=boxes, scores=scores, feats=x)
+            if include_attr:
+                preds["attr"] = attrs
+        else:
+            scores = torch.cat([cls_head[i](x[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
+            preds = dict(boxes=boxes, scores=scores, feats=x)
+        return preds
 
     def forward(
         self, x: list[torch.Tensor]
@@ -150,7 +191,16 @@ class Detect(nn.Module):
         preds = self.forward_head(x, **self.one2many)
         if self.end2end:
             x_detach = [xi.detach() for xi in x]
-            one2one = self.forward_head(x_detach, **self.one2one)
+            one2one = self.forward_head(x_detach, **self.one2one)  # include_attr=False
+            if not self.training and self.attr_nc > 0 and self.cv3 is not None:
+                # one2one_cv3's attr channels are never trained (include_attr=False throughout).
+                # cv3 (o2m) is kept alive after fuse() for exactly this purpose: supply the
+                # trained attr predictions at inference.
+                bs = x[0].shape[0]
+                one2one["attr"] = torch.cat(
+                    [self.cv3[i](x[i]).view(bs, self.nc + self.attr_nc, -1)[:, self.nc:]
+                     for i in range(self.nl)], dim=-1
+                )
             preds = {"one2many": preds, "one2one": one2one}
         if self.training:
             return preds
@@ -169,8 +219,12 @@ class Detect(nn.Module):
             (torch.Tensor): Concatenated tensor of decoded bounding boxes and class probabilities.
         """
         # Inference path
+        attr_nc = int(getattr(self, "attr_nc", 0) or 0)
         dbox = self._get_decode_boxes(x)
-        return torch.cat((dbox, x["scores"].sigmoid()), 1)
+        scores = x["scores"].sigmoid()
+        if attr_nc > 0 and "attr" in x:
+            return torch.cat((dbox, scores, x["attr"].sigmoid()), 1)
+        return torch.cat((dbox, scores), 1)
 
     def _get_decode_boxes(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
         """Get decoded boxes based on anchors and strides."""
@@ -184,6 +238,7 @@ class Detect(nn.Module):
 
     def bias_init(self):
         """Initialize Detect() biases, WARNING: requires stride availability."""
+        attr_nc = int(getattr(self, "attr_nc", 0) or 0)
         for i, (a, b) in enumerate(zip(self.one2many["box_head"], self.one2many["cls_head"])):  # from
             a[-1].bias.data[:] = 2.0  # box
             b[-1].bias.data[: self.nc] = math.log(
@@ -216,9 +271,17 @@ class Detect(nn.Module):
             (torch.Tensor): Processed predictions with shape (batch_size, min(max_det, num_anchors), 6) and last
                 dimension format [x1, y1, x2, y2, max_class_prob, class_index].
         """
-        boxes, scores = preds.split([4, self.nc], dim=-1)
+        attr_nc = int(getattr(self, "attr_nc", 0) or 0)
+        if attr_nc > 0:
+            boxes, scores, attrs = preds.split([4, self.nc, attr_nc], dim=-1)
+        else:
+            boxes, scores = preds.split([4, self.nc], dim=-1)
         scores, conf, idx = self.get_topk_index(scores, self.max_det)
         boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
+        if attr_nc > 0:
+            attrs = attrs.gather(dim=1, index=idx.repeat(1, 1, attr_nc))
+            out = torch.cat([boxes, scores, conf, attrs], dim=-1)
+            return torch.cat([out, idx.float()], dim=-1)
         return torch.cat([boxes, scores, conf], dim=-1)
 
     def get_topk_index(self, scores: torch.Tensor, max_det: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -248,7 +311,9 @@ class Detect(nn.Module):
 
     def fuse(self) -> None:
         """Remove the one2many head for inference optimization."""
-        self.cv2 = self.cv3 = None
+        self.cv2 = None
+        if not self.attr_nc:
+            self.cv3 = None  # kept alive for attr inference when attr_nc > 0
 
 
 class Segment(Detect):
@@ -283,7 +348,7 @@ class Segment(Detect):
             end2end (bool): Whether to use end-to-end NMS-free detection.
             ch (tuple): Tuple of channel sizes from backbone feature maps.
         """
-        super().__init__(nc, reg_max, end2end, ch)
+        super().__init__(nc, 0, reg_max, end2end, ch)
         self.nm = nm  # number of masks
         self.npr = npr  # number of protos
         self.proto = Proto(ch[0], self.npr, self.nm)  # protos
@@ -445,7 +510,7 @@ class OBB(Detect):
             end2end (bool): Whether to use end-to-end NMS-free detection.
             ch (tuple): Tuple of channel sizes from backbone feature maps.
         """
-        super().__init__(nc, reg_max, end2end, ch)
+        super().__init__(nc, 0, reg_max, end2end, ch)
         self.ne = ne  # number of extra parameters
 
         c4 = max(ch[0] // 4, self.ne)
@@ -565,17 +630,26 @@ class Pose(Detect):
         >>> outputs = pose(x)
     """
 
-    def __init__(self, nc: int = 80, kpt_shape: tuple = (17, 3), reg_max=16, end2end=False, ch: tuple = ()):
+    def __init__(
+        self,
+        nc: int = 80,
+        kpt_shape: tuple = (17, 3),
+        attr_nc: int = 0,
+        reg_max=16,
+        end2end=False,
+        ch: tuple = (),
+    ):
         """Initialize YOLO network with default parameters and Convolutional Layers.
 
         Args:
             nc (int): Number of classes.
             kpt_shape (tuple): Number of keypoints, number of dims (2 for x,y or 3 for x,y,visible).
+            attr_nc (int): Attribute head width (from model yaml); 0 disables.
             reg_max (int): Maximum number of DFL channels.
             end2end (bool): Whether to use end-to-end NMS-free detection.
             ch (tuple): Tuple of channel sizes from backbone feature maps.
         """
-        super().__init__(nc, reg_max, end2end, ch)
+        super().__init__(nc, attr_nc, reg_max, end2end, ch)
         self.kpt_shape = kpt_shape  # number of keypoints, number of dims (2 for x,y or 3 for x,y,visible)
         self.nk = kpt_shape[0] * kpt_shape[1]  # number of keypoints total
 
@@ -592,7 +666,7 @@ class Pose(Detect):
     @property
     def one2one(self):
         """Returns the one-to-one head components."""
-        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3, pose_head=self.one2one_cv4)
+        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3, pose_head=self.one2one_cv4, include_attr=False)
 
     def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
         """Decode predicted bounding boxes and class probabilities, concatenated with keypoints."""
@@ -600,10 +674,15 @@ class Pose(Detect):
         return torch.cat([preds, self.kpts_decode(x["kpts"])], dim=1)
 
     def forward_head(
-        self, x: list[torch.Tensor], box_head: torch.nn.Module, cls_head: torch.nn.Module, pose_head: torch.nn.Module
+        self,
+        x: list[torch.Tensor],
+        box_head: torch.nn.Module,
+        cls_head: torch.nn.Module,
+        pose_head: torch.nn.Module,
+        include_attr: bool = True,
     ) -> dict[str, torch.Tensor]:
         """Concatenates and returns predicted bounding boxes, class probabilities, and keypoints."""
-        preds = super().forward_head(x, box_head, cls_head)
+        preds = super().forward_head(x, box_head, cls_head, include_attr)
         if pose_head is not None:
             bs = x[0].shape[0]  # batch size
             preds["kpts"] = torch.cat([pose_head[i](x[i]).view(bs, self.nk, -1) for i in range(self.nl)], 2)
@@ -620,15 +699,27 @@ class Pose(Detect):
             (torch.Tensor): Processed predictions with shape (batch_size, min(max_det, num_anchors), 6 + self.nk) and
                 last dimension format [x1, y1, x2, y2, max_class_prob, class_index, keypoints].
         """
-        boxes, scores, kpts = preds.split([4, self.nc, self.nk], dim=-1)
+        has_row_idx = self.attr_nc > 0 and preds.shape[-1] == (4 + self.nc + self.attr_nc + self.nk + 1)
+        if has_row_idx:
+            preds = preds[..., :-1]
+        if self.attr_nc > 0:
+            boxes, scores, attrs, kpts = preds.split([4, self.nc, self.attr_nc, self.nk], dim=-1)
+        else:
+            boxes, scores, kpts = preds.split([4, self.nc, self.nk], dim=-1)
         scores, conf, idx = self.get_topk_index(scores, self.max_det)
         boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
         kpts = kpts.gather(dim=1, index=idx.repeat(1, 1, self.nk))
+        if self.attr_nc > 0:
+            attrs = attrs.gather(dim=1, index=idx.repeat(1, 1, self.attr_nc))
+            out = torch.cat([boxes, scores, conf, attrs, kpts], dim=-1)
+            return torch.cat([out, idx.float()], dim=-1)
         return torch.cat([boxes, scores, conf, kpts], dim=-1)
 
     def fuse(self) -> None:
         """Remove the one2many head for inference optimization."""
-        self.cv2 = self.cv3 = self.cv4 = None
+        self.cv2 = self.cv4 = None
+        if not self.attr_nc:
+            self.cv3 = None  # kept alive for attr inference when attr_nc > 0
 
     def kpts_decode(self, kpts: torch.Tensor) -> torch.Tensor:
         """Decode keypoints from predictions."""
@@ -673,17 +764,26 @@ class Pose26(Pose):
         >>> outputs = pose(x)
     """
 
-    def __init__(self, nc: int = 80, kpt_shape: tuple = (17, 3), reg_max=16, end2end=False, ch: tuple = ()):
+    def __init__(
+        self,
+        nc: int = 80,
+        kpt_shape: tuple = (17, 3),
+        attr_nc: int = 0,
+        reg_max=16,
+        end2end=False,
+        ch: tuple = (),
+    ):
         """Initialize YOLO network with default parameters and Convolutional Layers.
 
         Args:
             nc (int): Number of classes.
             kpt_shape (tuple): Number of keypoints, number of dims (2 for x,y or 3 for x,y,visible).
+            attr_nc (int): Attribute head width from yaml; 0 disables.
             reg_max (int): Maximum number of DFL channels.
             end2end (bool): Whether to use end-to-end NMS-free detection.
             ch (tuple): Tuple of channel sizes from backbone feature maps.
         """
-        super().__init__(nc, kpt_shape, reg_max, end2end, ch)
+        super().__init__(nc, kpt_shape, attr_nc, reg_max, end2end, ch)
         self.flow_model = RealNVP()
 
         c4 = max(ch[0] // 4, kpt_shape[0] * (kpt_shape[1] + 2))
@@ -718,6 +818,7 @@ class Pose26(Pose):
             pose_head=self.one2one_cv4,
             kpts_head=self.one2one_cv4_kpts,
             kpts_sigma_head=self.one2one_cv4_sigma,
+            include_attr=False,
         )
 
     def forward_head(
@@ -728,9 +829,10 @@ class Pose26(Pose):
         pose_head: torch.nn.Module,
         kpts_head: torch.nn.Module,
         kpts_sigma_head: torch.nn.Module,
+        include_attr: bool = True,
     ) -> dict[str, torch.Tensor]:
         """Concatenates and returns predicted bounding boxes, class probabilities, and keypoints."""
-        preds = Detect.forward_head(self, x, box_head, cls_head)
+        preds = Detect.forward_head(self, x, box_head, cls_head, include_attr)
         if pose_head is not None:
             bs = x[0].shape[0]  # batch size
             features = [pose_head[i](x[i]) for i in range(self.nl)]
@@ -739,6 +841,17 @@ class Pose26(Pose):
                 preds["kpts_sigma"] = torch.cat(
                     [kpts_sigma_head[i](features[i]).view(bs, self.nk_sigma, -1) for i in range(self.nl)], 2
                 )
+        # Run a trivial forward through flow_model so its parameters participate in
+        # the autograd graph built during the model forward pass.  Without this,
+        # flow_model params are "unused" in forward but receive gradients from
+        # PoseLoss26 during backward, which causes DDP to fire gradient-ready hooks
+        # twice ("Expected to mark a variable ready only once") when torch.compile
+        # is active.  The 0-scaled dummy adds zero to the predictions and produces
+        # zero gradients for flow_model from this path; real gradients still arrive
+        # through PoseLoss26.calculate_rle_loss.
+        if self.training and self.flow_model is not None:
+            dummy = self.flow_model.log_prob(preds["kpts"].new_zeros(1, 2)).sum() * 0.0
+            preds["kpts"] = preds["kpts"] + dummy
         return preds
 
     def fuse(self) -> None:
@@ -863,7 +976,7 @@ class WorldDetect(Detect):
             end2end (bool): Whether to use end-to-end NMS-free detection.
             ch (tuple): Tuple of channel sizes from backbone feature maps.
         """
-        super().__init__(nc, reg_max=reg_max, end2end=end2end, ch=ch)
+        super().__init__(nc, 0, reg_max=reg_max, end2end=end2end, ch=ch)
         c3 = max(ch[0], min(self.nc, 100))
         self.cv3 = nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1)) for x in ch)
         self.cv4 = nn.ModuleList(BNContrastiveHead(embed) if with_bn else ContrastiveHead() for _ in ch)
@@ -1004,7 +1117,7 @@ class YOLOEDetect(Detect):
             end2end (bool): Whether to use end-to-end NMS-free detection.
             ch (tuple): Tuple of channel sizes from backbone feature maps.
         """
-        super().__init__(nc, reg_max, end2end, ch)
+        super().__init__(nc, 0, reg_max, end2end, ch)
         c3 = max(ch[0], min(self.nc, 100))
         assert c3 <= embed
         assert with_bn

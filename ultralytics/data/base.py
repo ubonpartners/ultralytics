@@ -85,6 +85,7 @@ class BaseDataset(Dataset):
         classes: list[int] | None = None,
         fraction: float = 1.0,
         channels: int = 3,
+        sample_stride: int = 1,
     ):
         """Initialize BaseDataset with given configuration and options.
 
@@ -104,6 +105,7 @@ class BaseDataset(Dataset):
             fraction (float): Fraction of dataset to utilize.
             channels (int): Number of channels in the images (1 for grayscale, 3 for color). Color images loaded with
                 OpenCV are in BGR channel order.
+            sample_stride (int): Keep every Nth image after sorting image paths.
         """
         super().__init__()
         self.img_path = img_path
@@ -112,6 +114,7 @@ class BaseDataset(Dataset):
         self.single_cls = single_cls
         self.prefix = prefix
         self.fraction = fraction
+        self.sample_stride = max(int(sample_stride or 1), 1)
         self.channels = channels
         self.cv2_flag = cv2.IMREAD_GRAYSCALE if channels == 1 else cv2.IMREAD_COLOR
         self.im_files = self.get_img_files(self.img_path)
@@ -179,6 +182,8 @@ class BaseDataset(Dataset):
             assert im_files, f"{self.prefix}No images found in {img_path}. {FORMATS_HELP_MSG}"
         except Exception as e:
             raise FileNotFoundError(f"{self.prefix}Error loading data from {img_path}\n{HELP_URL}") from e
+        if self.sample_stride > 1:
+            im_files = im_files[:: self.sample_stride]
         if self.fraction < 1:
             im_files = im_files[: round(len(im_files) * self.fraction)]  # retain a fraction of the dataset
         check_file_speeds(im_files, prefix=self.prefix)  # check image read speeds
@@ -194,11 +199,14 @@ class BaseDataset(Dataset):
         for i in range(len(self.labels)):
             if include_class is not None:
                 cls = self.labels[i]["cls"]
+                attr = self.labels[i].get("attr", None)
                 bboxes = self.labels[i]["bboxes"]
                 segments = self.labels[i]["segments"]
                 keypoints = self.labels[i]["keypoints"]
                 j = (cls == include_class_array).any(1)
                 self.labels[i]["cls"] = cls[j]
+                if attr is not None:
+                    self.labels[i]["attr"] = attr[j]
                 self.labels[i]["bboxes"] = bboxes[j]
                 if segments:
                     self.labels[i]["segments"] = [segments[si] for si, idx in enumerate(j) if idx]

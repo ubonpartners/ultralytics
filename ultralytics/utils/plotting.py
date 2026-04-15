@@ -578,14 +578,18 @@ def plot_labels(boxes, cls, names=(), save_dir=Path(""), on_plot=None):
 
     # Plot dataset labels
     LOGGER.info(f"Plotting labels to {save_dir / 'labels.jpg'}... ")
-    nc = int(cls.max() + 1)  # number of classes
+    if cls.ndim == 2 and cls.shape[1] == 1:
+        class_ids = cls.squeeze(1)
+    else:
+        class_ids = cls
+    nc = int(class_ids.max() + 1) if len(class_ids) else len(names)
     boxes = boxes[:1000000]  # limit to 1M boxes
     x = polars.DataFrame(boxes, schema=["x", "y", "width", "height"])
 
     # Matplotlib labels
     subplot_3_4_color = LinearSegmentedColormap.from_list("white_blue", ["white", "blue"])
     ax = plt.subplots(2, 2, figsize=(8, 8), tight_layout=True)[1].ravel()
-    y = ax[0].hist(cls, bins=np.linspace(0, nc, nc + 1) - 0.5, rwidth=0.8)
+    y = ax[0].hist(class_ids, bins=np.linspace(0, nc, nc + 1) - 0.5, rwidth=0.8)
     for i in range(nc):
         y[2].patches[i].set_color([x / 255 for x in colors(i)])
     ax[0].set_ylabel("instances")
@@ -597,7 +601,8 @@ def plot_labels(boxes, cls, names=(), save_dir=Path(""), on_plot=None):
         ax[0].set_xlabel("classes")
     boxes = np.column_stack([0.5 - boxes[:, 2:4] / 2, 0.5 + boxes[:, 2:4] / 2]) * 1000
     img = Image.fromarray(np.ones((1000, 1000, 3), dtype=np.uint8) * 255)
-    for class_id, box in zip(cls[:500], boxes[:500]):
+    for class_id, box in zip(class_ids[:500], boxes[:500]):
+        class_id = int(class_id) if not hasattr(class_id, "shape") else int(class_id.squeeze())
         ImageDraw.Draw(img).rectangle(box.tolist(), width=1, outline=colors(class_id))  # plot
     ax[1].imshow(img)
     ax[1].axis("off")
@@ -772,6 +777,8 @@ def plot_images(
         if len(cls) > 0:
             idx = batch_idx == i
             classes = cls[idx].astype("int")
+            if classes.ndim == 2 and classes.shape[1] == 1:
+                classes = classes.squeeze(1)
             labels = confs is None
             conf = confs[idx] if confs is not None else None  # check for confidence presence (label vs pred)
 

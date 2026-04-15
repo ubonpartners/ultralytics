@@ -188,6 +188,20 @@ class BaseValidator:
             else:
                 raise FileNotFoundError(emojis(f"Dataset '{self.args.data}' for task={self.args.task} not found ❌"))
 
+            # Keep standalone val aligned with train-time dataset selection for attribute datasets.
+            if "attributes" in self.data:
+                self.args.attributes = bool(self.data["attributes"])
+            if "attr_nc" in self.data:
+                self.args.attr_nc = int(self.data["attr_nc"])
+            if "attr_label_format" in self.data:
+                self.args.attr_label_format = str(self.data["attr_label_format"]).lower()
+            if (
+                not getattr(self.args, "attributes", False)
+                and int(getattr(self.args, "attr_nc", 0) or 0) > 0
+                and str(getattr(self.args, "attr_label_format", "combined")).lower() == "split"
+            ):
+                self.args.attributes = True
+
             if self.device.type in {"cpu", "mps"}:
                 self.args.workers = 0  # faster CPU val as time dominated by inference, not dataloading
             if not (pt or (getattr(model, "dynamic", False) and fmt != "imx")):
@@ -290,7 +304,11 @@ class BaseValidator:
         # Dx10 matrix, where D - detections, 10 - IoU thresholds
         correct = np.zeros((pred_classes.shape[0], self.iouv.shape[0])).astype(bool)
         # LxD matrix where L - labels (rows), D - detections (columns)
-        correct_class = true_classes[:, None] == pred_classes
+        if true_classes.ndim == 1 or true_classes.shape[-1] == 1:
+            correct_class = true_classes[:, None] == pred_classes
+        else:
+            pred_classes_one_hot = torch.nn.functional.one_hot(pred_classes.long(), num_classes=self.nc)
+            correct_class = (true_classes.bool() & pred_classes_one_hot.unsqueeze(1)).any(dim=-1).T
         iou = iou * correct_class  # zero out the wrong classes
         iou = iou.cpu().numpy()
         for i, threshold in enumerate(self.iouv.cpu().tolist()):

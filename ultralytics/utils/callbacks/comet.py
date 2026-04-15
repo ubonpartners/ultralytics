@@ -521,6 +521,8 @@ def on_pretrain_routine_start(trainer) -> None:
 
 def on_train_epoch_end(trainer) -> None:
     """Log metrics and save batch images at the end of training epochs."""
+    if RANK not in {-1, 0}:
+        return
     experiment = comet_ml.get_running_experiment()
     if not experiment:
         return
@@ -550,6 +552,8 @@ def on_fit_epoch_end(trainer) -> None:
         >>> # Inside a training loop
         >>> on_fit_epoch_end(trainer)  # Log metrics and assets to Comet ML
     """
+    if RANK not in {-1, 0}:
+        return
     experiment = comet_ml.get_running_experiment()
     if not experiment:
         return
@@ -578,6 +582,8 @@ def on_fit_epoch_end(trainer) -> None:
 
 def on_train_end(trainer) -> None:
     """Perform operations at the end of training."""
+    if RANK not in {-1, 0}:
+        return
     experiment = comet_ml.get_running_experiment()
     if not experiment:
         return

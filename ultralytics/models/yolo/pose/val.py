@@ -9,8 +9,8 @@ import numpy as np
 import torch
 
 from ultralytics.models.yolo.detect import DetectionValidator
-from ultralytics.utils import ops
-from ultralytics.utils.metrics import OKS_SIGMA, PoseMetrics, kpt_iou
+from ultralytics.utils import LOGGER, ops
+from ultralytics.utils.metrics import FACEPOSEBOX_SIGMA, FACEPOSE_SIGMA, OKS_SIGMA, PoseMetrics, kpt_iou
 
 
 class PoseValidator(DetectionValidator):
@@ -78,6 +78,22 @@ class PoseValidator(DetectionValidator):
 
     def get_desc(self) -> str:
         """Return description of evaluation metrics in string format."""
+        attr_col = bool(getattr(self, "attr_enabled", False)) or int(getattr(self.args, "attr_nc", 0) or 0) > 0
+        if attr_col:
+            return ("%22s" + "%11s" * 11) % (
+                "Class",
+                "Images",
+                "Instances",
+                "Box(P",
+                "R",
+                "mAP50",
+                "mAP50-95)",
+                "mAP50(A)",
+                "Pose(P",
+                "R",
+                "mAP50",
+                "mAP50-95)",
+            )
         return ("%22s" + "%11s" * 10) % (
             "Class",
             "Images",
@@ -92,6 +108,32 @@ class PoseValidator(DetectionValidator):
             "mAP50-95)",
         )
 
+    def print_results(self) -> None:
+        """Print training/validation set metrics per class with optional Attr mAP50 column."""
+        if not self.attr_enabled:
+            return super().print_results()
+
+        mean = self.metrics.mean_results()  # [box4, pose4]
+        row = [*mean[:4], self.attr_map50, *mean[4:]]
+        pf_all = "%22s" + "%11i" * 2 + "%11.3g" * len(row)
+        LOGGER.info(pf_all % ("all", self.seen, self.metrics.nt_per_class.sum(), *row))
+        if self.metrics.nt_per_class.sum() == 0:
+            LOGGER.warning(f"no labels found in {self.args.task} set, cannot compute metrics without labels")
+
+        # Keep per-class verbose rows in the original box+pose format (no class-wise attr AP currently computed).
+        if self.args.verbose and not self.training and self.nc > 1 and len(self.metrics.stats):
+            pf_cls = "%22s" + "%11i" * 2 + "%11.3g" * len(self.metrics.keys)
+            for i, c in enumerate(self.metrics.ap_class_index):
+                LOGGER.info(
+                    pf_cls
+                    % (
+                        self.names[c],
+                        self.metrics.nt_per_image[c],
+                        self.metrics.nt_per_class[c],
+                        *self.metrics.class_result(i),
+                    )
+                )
+
     def init_metrics(self, model: torch.nn.Module) -> None:
         """Initialize evaluation metrics for YOLO pose validation.
 
@@ -101,8 +143,17 @@ class PoseValidator(DetectionValidator):
         super().init_metrics(model)
         self.kpt_shape = self.data["kpt_shape"]
         is_pose = self.kpt_shape == [17, 3]
+        is_facepose = self.kpt_shape == [22, 3]
+        is_faceposebox = self.kpt_shape == [23, 3]
         nkpt = self.kpt_shape[0]
-        self.sigma = OKS_SIGMA if is_pose else np.ones(nkpt) / nkpt
+        if is_pose:
+            self.sigma = OKS_SIGMA
+        elif is_facepose:
+            self.sigma = FACEPOSE_SIGMA
+        elif is_faceposebox:
+            self.sigma = FACEPOSEBOX_SIGMA
+        else:
+            self.sigma = np.ones(nkpt) / nkpt
 
     def postprocess(self, preds: torch.Tensor) -> list[dict[str, torch.Tensor]]:
         """Postprocess YOLO predictions to extract and reshape keypoints for pose estimation.
@@ -128,8 +179,25 @@ class PoseValidator(DetectionValidator):
             task-specific data beyond basic detection.
         """
         preds = super().postprocess(preds)
+        backend = getattr(self, "model", None)
+        pt_model = getattr(backend, "model", backend)
+        head = None
+        try:
+            head = pt_model.model[-1]
+        except Exception:
+            try:
+                head = pt_model[-1]
+            except Exception:
+                head = None
+        attr_nc = getattr(head, "attr_nc", 0) if head is not None else 0
         for pred in preds:
-            pred["keypoints"] = pred.pop("extra").view(-1, *self.kpt_shape)  # remove extra if exists
+            extra = pred.pop("extra")
+            if attr_nc and extra.shape[1] == attr_nc + self.kpt_shape[0] * self.kpt_shape[1] + 1:
+                extra = extra[:, :-1]
+            if attr_nc:
+                pred["attr"] = extra[:, :attr_nc]
+                extra = extra[:, attr_nc:]
+            pred["keypoints"] = extra.view(-1, *self.kpt_shape)  # remove extra if exists
         return preds
 
     def _prepare_batch(self, si: int, batch: dict[str, Any]) -> dict[str, Any]:
@@ -152,7 +220,7 @@ class PoseValidator(DetectionValidator):
         kpts = kpts.clone()
         kpts[..., 0] *= w
         kpts[..., 1] *= h
-        pbatch["keypoints"] = kpts
+        pbatch["keypoints"] = kpts[pbatch["rows"]]
         return pbatch
 
     def _process_batch(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> dict[str, np.ndarray]:

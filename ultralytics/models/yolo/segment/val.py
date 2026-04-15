@@ -102,8 +102,14 @@ class SegmentationValidator(DetectionValidator):
         proto = preds[0][1] if isinstance(preds[0], tuple) else preds[1]
         preds = super().postprocess(preds[0])
         imgsz = [4 * x for x in proto.shape[2:]]  # get image size from proto
+        attr_nc = getattr(self.model.model[-1], "attr_nc", 0) if hasattr(self, "model") else 0
         for i, pred in enumerate(preds):
             coefficient = pred.pop("extra")
+            if attr_nc and coefficient.shape[1] == attr_nc + self.model.model[-1].nm + 1:
+                coefficient = coefficient[:, :-1]
+            if attr_nc:
+                pred["attr"] = coefficient[:, :attr_nc]
+                coefficient = coefficient[:, attr_nc:]
             pred["masks"] = (
                 self.process(proto[i], coefficient, pred["bboxes"], shape=imgsz)
                 if coefficient.shape[0]

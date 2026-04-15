@@ -58,9 +58,31 @@ class PosePredictor(DetectionPredictor):
             (Results): The result object containing the original image, image path, class names, bounding boxes, and
                 keypoints.
         """
+        # `self.model` is an AutoBackend wrapper at runtime.
+        # For PyTorch weights AutoBackend.model is a PoseModel/DetectionModel instance, whose actual modules live in
+        # `.model` (nn.Sequential). Older code incorrectly assumed `self.model.model[-1]` was valid.
+        backend = self.model
+        pt_model = getattr(backend, "model", backend)
+        head = None
+        try:
+            head = pt_model.model[-1]  # PoseModel/DetectionModel -> nn.Sequential head
+        except Exception:
+            try:
+                head = pt_model[-1]  # last resort if model itself is subscriptable
+            except Exception:
+                head = None
+
+        attr_nc = getattr(head, "attr_nc", 0) if head is not None else 0
+        kpt_start = 6 + attr_nc
         result = super().construct_result(pred, img, orig_img, img_path)
-        # Extract keypoints from prediction and reshape according to model's keypoint shape
-        pred_kpts = pred[:, 6:].view(pred.shape[0], *self.model.kpt_shape)
+        if attr_nc:
+            result.update(attributes=pred[:, 6:kpt_start])
+        # Extract keypoints from prediction and reshape according to model's keypoint shape.
+        # Use a fixed-width slice because E2E postprocess appends a trailing row-index column
+        # (Pose.postprocess line: torch.cat([out, idx.float()], dim=-1)) so pred[:, kpt_start:]
+        # may be one element wider than kpt_shape[0]*kpt_shape[1].
+        nk_flat = self.model.kpt_shape[0] * self.model.kpt_shape[1]
+        pred_kpts = pred[:, kpt_start : kpt_start + nk_flat].view(pred.shape[0], *self.model.kpt_shape)
         # Scale keypoints coordinates to match the original image dimensions
         pred_kpts = ops.scale_coords(img.shape[2:], pred_kpts, orig_img.shape)
         result.update(keypoints=pred_kpts)

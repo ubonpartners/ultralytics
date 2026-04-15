@@ -14,7 +14,7 @@ from ultralytics.data import build_dataloader, build_yolo_dataset, converter
 from ultralytics.engine.validator import BaseValidator
 from ultralytics.utils import LOGGER, RANK, nms, ops
 from ultralytics.utils.checks import check_requirements
-from ultralytics.utils.metrics import ConfusionMatrix, DetMetrics, box_iou
+from ultralytics.utils.metrics import ConfusionMatrix, DetMetrics, ap_per_class, box_iou
 from ultralytics.utils.plotting import plot_images
 
 
@@ -59,6 +59,11 @@ class DetectionValidator(BaseValidator):
         self.iouv = torch.linspace(0.5, 0.95, 10)  # IoU vector for mAP@0.5:0.95
         self.niou = self.iouv.numel()
         self.metrics = DetMetrics()
+        self.attr_nc = 0
+        self.attr_enabled = False
+        self.attr_names = {}
+        self.attr_conf = 0.001
+        self.attr_map50 = 0.0
 
     def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
         """Preprocess batch of images for YOLO validation.
@@ -81,6 +86,7 @@ class DetectionValidator(BaseValidator):
         Args:
             model (torch.nn.Module): Model to validate.
         """
+        self.model = model
         val = self.data.get(self.args.split, "")  # validation path
         self.is_coco = (
             isinstance(val, str)
@@ -99,6 +105,26 @@ class DetectionValidator(BaseValidator):
         self.metrics.clear_stats()
         self.metrics.clear_image_metrics()
         self.confusion_matrix = ConfusionMatrix(names=model.names, save_matches=self.args.plots and self.args.visualize)
+        backend = model
+        pt_model = getattr(backend, "model", backend)
+        head = None
+        try:
+            head = pt_model.model[-1]
+        except Exception:
+            try:
+                head = pt_model[-1]
+            except Exception:
+                head = None
+        self.attr_nc = int(getattr(head, "attr_nc", 0) or 0)
+        self.attr_enabled = self.attr_nc > 0
+        attr_names = getattr(model, "attr_names", None)
+        if isinstance(attr_names, (list, tuple)) and len(attr_names) == self.attr_nc:
+            self.attr_names = {i: str(n) for i, n in enumerate(attr_names)}
+        else:
+            self.attr_names = {i: f"attr_{i}" for i in range(self.attr_nc)}
+        if self.attr_enabled:
+            # Attribute AP@0.5 stats: tp is shape (N, 1) to match metrics.ap_per_class() interface.
+            self.metrics.stats.update(attr_tp=[], attr_conf=[], attr_pred_cls=[], attr_target_cls=[])
 
     def get_desc(self) -> str:
         """Return a formatted string summarizing class metrics of YOLO model."""
@@ -118,14 +144,29 @@ class DetectionValidator(BaseValidator):
             preds,
             self.args.conf,
             self.args.iou,
-            nc=0 if self.args.task == "detect" else self.nc,
-            multi_label=True,
+            nc=self.nc,
             agnostic=self.args.single_cls or self.args.agnostic_nms,
             max_det=self.args.max_det,
             end2end=self.end2end,
             rotated=self.args.task == "obb",
         )
-        return [{"bboxes": x[:, :4], "conf": x[:, 4], "cls": x[:, 5], "extra": x[:, 6:]} for x in outputs]
+        backend = getattr(self, "model", None)
+        pt_model = getattr(backend, "model", backend)
+        head = None
+        try:
+            head = pt_model.model[-1]
+        except Exception:
+            try:
+                head = pt_model[-1]
+            except Exception:
+                head = None
+        attr_nc = getattr(head, "attr_nc", 0) if head is not None else 0
+        cleaned = []
+        for x in outputs:
+            if attr_nc and x.shape[1] == 6 + attr_nc + 1:
+                x = x[:, :-1]
+            cleaned.append({"bboxes": x[:, :4], "conf": x[:, 4], "cls": x[:, 5], "extra": x[:, 6:]})
+        return cleaned
 
     def _prepare_batch(self, si: int, batch: dict[str, Any]) -> dict[str, Any]:
         """Prepare a batch of images and annotations for validation.
@@ -140,11 +181,16 @@ class DetectionValidator(BaseValidator):
         idx = batch["batch_idx"] == si
         cls = batch["cls"][idx].squeeze(-1)
         bbox = batch["bboxes"][idx]
+        rows = torch.arange(cls.shape[0], device=cls.device)
         ori_shape = batch["ori_shape"][si]
         imgsz = batch["img"].shape[2:]
         ratio_pad = batch["ratio_pad"][si]
         if cls.shape[0]:
             bbox = ops.xywh2xyxy(bbox) * torch.tensor(imgsz, device=self.device)[[1, 0, 1, 0]]  # target boxes
+        attrs = None
+        if self.attr_enabled and "attr" in batch:
+            attrs = batch["attr"][idx]
+            attrs = attrs[rows] if attrs.shape[0] else attrs
         return {
             "cls": cls,
             "bboxes": bbox,
@@ -152,6 +198,8 @@ class DetectionValidator(BaseValidator):
             "imgsz": imgsz,
             "ratio_pad": ratio_pad,
             "im_file": batch["im_file"][si],
+            "rows": rows,
+            "attr": attrs,
         }
 
     def _prepare_pred(self, pred: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -181,16 +229,17 @@ class DetectionValidator(BaseValidator):
 
             cls = pbatch["cls"].cpu().numpy()
             no_pred = predn["cls"].shape[0] == 0
-            self.metrics.update_stats(
-                {
-                    **self._process_batch(predn, pbatch),
-                    "target_cls": cls,
-                    "target_img": np.unique(cls),
-                    "conf": np.zeros(0) if no_pred else predn["conf"].cpu().numpy(),
-                    "pred_cls": np.zeros(0) if no_pred else predn["cls"].cpu().numpy(),
-                    "im_name": Path(pbatch["im_file"]).name,
-                }
-            )
+            stat = {
+                **self._process_batch(predn, pbatch),
+                "target_cls": cls,
+                "target_img": np.unique(cls),
+                "conf": np.zeros(0) if no_pred else predn["conf"].cpu().numpy(),
+                "pred_cls": np.zeros(0) if no_pred else predn["cls"].cpu().numpy(),
+                "im_name": Path(pbatch["im_file"]).name,
+            }
+            if self.attr_enabled:
+                stat.update(self._process_attr_batch(predn, pbatch))
+            self.metrics.update_stats(stat)
             # Evaluate
             if self.args.plots:
                 self.confusion_matrix.process_batch(predn, pbatch, conf=self.args.conf)
@@ -266,8 +315,13 @@ class DetectionValidator(BaseValidator):
             (dict[str, Any]): Dictionary containing metrics results.
         """
         self.metrics.process(save_dir=self.save_dir, plot=self.args.plots, on_plot=self.on_plot)
+        stats = self.metrics.results_dict
+        if self.attr_enabled:
+            self.attr_map50 = self._process_attr_ap50()
+            stats["metrics/mAP50(A)"] = self.attr_map50
+            self.metrics.attr_map50 = self.attr_map50
         self.metrics.clear_stats()
-        return self.metrics.results_dict
+        return stats
 
     def print_results(self) -> None:
         """Print training/validation set metrics per class."""
@@ -288,6 +342,8 @@ class DetectionValidator(BaseValidator):
                         *self.metrics.class_result(i),
                     )
                 )
+        if self.attr_enabled:
+            LOGGER.info(f"%22s%11.3g" % ("Attr mAP50", self.attr_map50))
 
     def _process_batch(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> dict[str, np.ndarray]:
         """Return correct prediction matrix.
@@ -304,6 +360,109 @@ class DetectionValidator(BaseValidator):
             return {"tp": np.zeros((preds["cls"].shape[0], self.niou), dtype=bool)}
         iou = box_iou(batch["bboxes"], preds["bboxes"])
         return {"tp": self.match_predictions(preds["cls"], batch["cls"], iou).cpu().numpy()}
+
+    def _match_preds_to_gts_iou50(
+        self, preds: dict[str, torch.Tensor], batch: dict[str, Any], iou_thres: float = 0.5
+    ) -> np.ndarray:
+        """Map each prediction row to a matched GT index at IoU>=0.5 and class-consistent matching."""
+        n_pred = preds["cls"].shape[0]
+        if n_pred == 0 or batch["cls"].shape[0] == 0:
+            return np.full((n_pred,), -1, dtype=np.int64)
+
+        iou = box_iou(batch["bboxes"], preds["bboxes"])
+        gt_cls = batch["cls"]
+        pred_cls = preds["cls"]
+        if gt_cls.ndim == 1 or gt_cls.shape[-1] == 1:
+            correct_class = gt_cls[:, None] == pred_cls
+        else:
+            pred_one_hot = torch.nn.functional.one_hot(pred_cls.long(), num_classes=self.nc)
+            correct_class = (gt_cls.bool() & pred_one_hot.unsqueeze(1)).any(dim=-1).T
+        iou = (iou * correct_class).cpu().numpy()
+        matches = np.array(np.nonzero(iou >= iou_thres)).T
+        det_to_gt = np.full((n_pred,), -1, dtype=np.int64)
+        if matches.shape[0] == 0:
+            return det_to_gt
+        if matches.shape[0] > 1:
+            matches = matches[iou[matches[:, 0], matches[:, 1]].argsort()[::-1]]
+            matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
+            matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
+        det_to_gt[matches[:, 1].astype(np.int64)] = matches[:, 0].astype(np.int64)
+        return det_to_gt
+
+    def _process_attr_batch(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> dict[str, np.ndarray]:
+        """Build AP@0.5 style attribute stats similar to dataset-processor/map.py."""
+        empty = {
+            "attr_tp": np.zeros((0, 1), dtype=bool),
+            "attr_conf": np.zeros(0, dtype=np.float32),
+            "attr_pred_cls": np.zeros(0, dtype=np.int64),
+            "attr_target_cls": np.zeros(0, dtype=np.int64),
+        }
+        gt_attr = batch.get("attr")
+        if gt_attr is None or gt_attr.numel() == 0 or self.attr_nc <= 0:
+            return empty
+
+        pred_attr = preds.get("attr")
+        if pred_attr is None:
+            extra = preds.get("extra")
+            if extra is not None and extra.shape[1] >= self.attr_nc:
+                pred_attr = extra[:, : self.attr_nc]
+        if pred_attr is None:
+            pred_attr = gt_attr.new_zeros((0, self.attr_nc))
+        elif pred_attr.shape[1] > self.attr_nc:
+            pred_attr = pred_attr[:, : self.attr_nc]
+
+        gt_attr_np = gt_attr.float().cpu().numpy()
+        target_cls = np.nonzero(gt_attr_np > 0.5)[1].astype(np.int64)
+
+        if pred_attr.shape[0] == 0:
+            empty["attr_target_cls"] = target_cls
+            return empty
+
+        det_to_gt = self._match_preds_to_gts_iou50(preds, batch, iou_thres=0.5)
+        pred_attr_np = pred_attr.float().cpu().numpy()
+
+        pred_cls, conf, tp = [], [], []
+        for det_idx, row in enumerate(pred_attr_np):
+            pos_idx = np.nonzero(row > self.attr_conf)[0]
+            if pos_idx.size == 0:
+                continue
+            gt_idx = det_to_gt[det_idx]
+            matched_attr = gt_attr_np[gt_idx] if gt_idx >= 0 else None
+            for k in pos_idx.tolist():
+                pred_cls.append(k)
+                conf.append(float(row[k]))
+                tp.append(bool(matched_attr is not None and k < matched_attr.shape[0] and matched_attr[k] > 0.5))
+
+        return {
+            "attr_tp": np.array(tp, dtype=bool)[:, None] if tp else np.zeros((0, 1), dtype=bool),
+            "attr_conf": np.array(conf, dtype=np.float32),
+            "attr_pred_cls": np.array(pred_cls, dtype=np.int64),
+            "attr_target_cls": target_cls,
+        }
+
+    def _process_attr_ap50(self) -> float:
+        """Compute single-threshold attribute AP at IoU=0.5."""
+        if not self.attr_enabled:
+            return 0.0
+        try:
+            tp = np.concatenate(self.metrics.stats["attr_tp"], 0)
+            conf = np.concatenate(self.metrics.stats["attr_conf"], 0)
+            pred_cls = np.concatenate(self.metrics.stats["attr_pred_cls"], 0)
+            target_cls = np.concatenate(self.metrics.stats["attr_target_cls"], 0)
+        except (KeyError, ValueError):
+            return 0.0
+        if target_cls.size == 0:
+            return 0.0
+        ap = ap_per_class(
+            tp,
+            conf,
+            pred_cls,
+            target_cls,
+            plot=False,
+            names=self.attr_names,
+            prefix="Attr",
+        )[5]
+        return float(ap[:, 0].mean()) if len(ap) else 0.0
 
     def build_dataset(self, img_path: str, mode: str = "val", batch: int | None = None) -> torch.utils.data.Dataset:
         """Build YOLO Dataset.

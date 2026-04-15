@@ -263,7 +263,7 @@ class Results(SimpleClass, DataExportMixin):
         self.names = names
         self.path = path
         self.save_dir = None
-        self._keys = "boxes", "masks", "probs", "keypoints", "obb"
+        self._keys = "boxes", "masks", "probs", "keypoints", "obb", "attributes"
 
     def __getitem__(self, idx):
         """Return a Results object for a specific index of inference results.
@@ -305,6 +305,7 @@ class Results(SimpleClass, DataExportMixin):
         probs: torch.Tensor | None = None,
         obb: torch.Tensor | None = None,
         keypoints: torch.Tensor | None = None,
+        attributes: torch.Tensor | None = None,
     ):
         """Update the Results object with new detection data.
 
@@ -318,6 +319,7 @@ class Results(SimpleClass, DataExportMixin):
             probs (torch.Tensor | None): A tensor of shape (num_classes,) containing class probabilities.
             obb (torch.Tensor | None): A tensor of shape (N, 7) or (N, 8) containing oriented bounding box coordinates.
             keypoints (torch.Tensor | None): A tensor of shape (N, K, 3) containing keypoints, were K=17 for persons.
+            attributes (torch.Tensor | None): A tensor of shape (N, attr_nc) containing per-detection attribute scores.
 
         Examples:
             >>> results = model("image.jpg")
@@ -334,6 +336,8 @@ class Results(SimpleClass, DataExportMixin):
             self.obb = OBB(obb, self.orig_shape)
         if keypoints is not None:
             self.keypoints = Keypoints(keypoints, self.orig_shape)
+        if attributes is not None:
+            self.attributes = attributes
 
     def _apply(self, fn: str, *args, **kwargs):
         """Apply a function to all non-empty attributes and return a new Results object with modified attributes.
@@ -1149,6 +1153,9 @@ class Keypoints(BaseTensor):
         """
         if keypoints.ndim == 2:
             keypoints = keypoints[None, :]
+        if keypoints.shape[2] == 3:
+            mask = keypoints[..., 2] < 0.01
+            keypoints[..., :2][mask] = 0
         super().__init__(keypoints, orig_shape)
         self.has_visible = self.data.shape[-1] == 3
 

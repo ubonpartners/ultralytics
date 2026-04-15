@@ -145,6 +145,14 @@ class DetectionTrainer(BaseTrainer):
         self.model.nc = self.data["nc"]  # attach number of classes to model
         self.model.names = self.data["names"]  # attach class names to model
         self.model.args = self.args  # attach hyperparameters to model
+        # Attach attribute names when using an attribute head (saved with checkpoint for inference)
+        attr_nc = getattr(unwrap_model(self.model), "yaml", {}).get("attr_nc", 0) or self.data.get("attr_nc", 0)
+        if attr_nc:
+            attr_names = self.data.get("attr_names")
+            if isinstance(attr_names, list) and len(attr_names) == attr_nc:
+                self.model.attr_names = list(attr_names)
+            else:
+                self.model.attr_names = [f"attr_{i}" for i in range(attr_nc)]
         if getattr(self.model, "end2end"):
             self.model.set_head_attr(max_det=self.args.max_det)
 
@@ -178,14 +186,20 @@ class DetectionTrainer(BaseTrainer):
         Returns:
             (DetectionModel): YOLO detection model.
         """
-        model = DetectionModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
+        model = DetectionModel(
+            cfg, nc=self.data["nc"], attr_nc=self.args.attr_nc, ch=self.data["channels"], verbose=verbose and RANK == -1
+        )
         if weights:
             model.load(weights)
         return model
 
     def get_validator(self):
         """Return a DetectionValidator for YOLO model validation."""
-        self.loss_names = "box_loss", "cls_loss", "dfl_loss"
+        self.loss_names = ("box_loss", "cls_loss", "dfl_loss", "attr_loss") if self.args.attributes else (
+            "box_loss",
+            "cls_loss",
+            "dfl_loss",
+        )
         return yolo.detect.DetectionValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )
@@ -235,7 +249,7 @@ class DetectionTrainer(BaseTrainer):
         """Create a labeled training plot of the YOLO model."""
         boxes = np.concatenate([lb["bboxes"] for lb in self.train_loader.dataset.labels], 0)
         cls = np.concatenate([lb["cls"] for lb in self.train_loader.dataset.labels], 0)
-        plot_labels(boxes, cls.squeeze(), names=self.data["names"], save_dir=self.save_dir, on_plot=self.on_plot)
+        plot_labels(boxes, cls, names=self.data["names"], save_dir=self.save_dir, on_plot=self.on_plot)
 
     def auto_batch(self):
         """Get optimal batch size by calculating memory occupation of model.

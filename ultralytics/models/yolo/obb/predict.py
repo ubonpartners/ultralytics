@@ -52,7 +52,13 @@ class OBBPredictor(DetectionPredictor):
             (Results): The result object containing the original image, image path, class names, and oriented bounding
                 boxes.
         """
+        attr_nc = getattr(self.model.model[-1], "attr_nc", 0)
+        if attr_nc and pred.shape[1] >= 6 + attr_nc + 1:
+            pred = pred[:, :-1]
         rboxes = torch.cat([pred[:, :4], pred[:, -1:]], dim=-1)
         rboxes[:, :4] = ops.scale_boxes(img.shape[2:], rboxes[:, :4], orig_img.shape, xywh=True)
         obb = torch.cat([rboxes, pred[:, 4:6]], dim=-1)
-        return Results(orig_img, path=img_path, names=self.model.names, obb=obb)
+        result = Results(orig_img, path=img_path, names=self.model.names, obb=obb)
+        if attr_nc:
+            result.update(attributes=pred[:, 6 : 6 + attr_nc])
+        return result

@@ -23,6 +23,77 @@ OKS_SIGMA = (
 )
 RLE_WEIGHT = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.2, 1.2, 1.5, 1.5, 1.0, 1.0, 1.2, 1.2, 1.5, 1.5])
 
+# OKS sigma for 22-keypoint face+pose layout:
+# [leye, reye, nose, lear, rear, mouth_l, mouth_r, mouth_t,  (face, 8)
+#  lwrist, rwrist,                                             (hands, 2)
+#  lshoulder, rshoulder, lelbow, relbow,                      (upper arms, 4)
+#  lhip, rhip, lknee, rknee, lankle, rankle]                  (legs, 6 + 2 extra)
+# Sigma values: face points use tighter sigmas (~0.025); limb endpoints use standard COCO body sigmas.
+FACEPOSE_SIGMA = (
+    np.array(
+        [
+            0.25,
+            0.25,
+            0.26,
+            0.25,
+            0.25,
+            0.26,
+            0.25,
+            0.25,
+            0.35,
+            0.35,
+            0.79,
+            0.79,
+            0.72,
+            0.72,
+            0.62,
+            0.62,
+            1.07,
+            1.07,
+            0.87,
+            0.87,
+            0.89,
+            0.89,
+        ],
+        dtype=np.float32,
+    )
+    / 10.0
+)
+# OKS sigma for 23-keypoint layout: 17 COCO body keypoints + 4 face-box corners + 2 face anchor points.
+# The 4 trailing face-box corner sigmas (0.09) are set looser than face landmarks (0.025) because the
+# face bounding box corners are derived quantities rather than precise anatomical landmarks.
+FACEPOSEBOX_SIGMA = (
+    np.array(
+        [
+            0.26,
+            0.25,
+            0.25,
+            0.35,
+            0.35,
+            0.79,
+            0.79,
+            0.72,
+            0.72,
+            0.62,
+            0.62,
+            1.07,
+            1.07,
+            0.87,
+            0.87,
+            0.89,
+            0.89,
+            0.25,
+            0.25,
+            0.9,
+            0.9,
+            0.9,
+            0.9,
+        ],
+        dtype=np.float32,
+    )
+    / 10.0
+)
+
 
 def bbox_ioa(box1: np.ndarray, box2: np.ndarray, iou: bool = False, eps: float = 1e-7) -> np.ndarray:
     """Calculate the intersection over box2 area given box1 and box2.
@@ -401,14 +472,19 @@ class ConfusionMatrix(DataExportMixin):
                     self._append_matches("FP", detections, i)
             return
         if no_pred:
-            gt_classes = gt_cls.int().tolist()
+            gt_classes = gt_cls.int()
             for i, gc in enumerate(gt_classes):
-                self.matrix[self.nc, gc] += 1  # FN
+                if gt_cls.ndim == 1 or gt_cls.shape[-1] == 1:
+                    g = int(gc)
+                    self.matrix[self.nc, g] += 1  # FN
+                else:
+                    for g in gc.nonzero(as_tuple=False).flatten().tolist():
+                        self.matrix[self.nc, g] += 1  # FN
                 self._append_matches("FN", batch, i)
             return
 
         detections = {k: detections[k][detections["conf"] > conf] for k in detections}
-        gt_classes = gt_cls.int().tolist()
+        gt_classes = gt_cls.int()
         detection_classes = detections["cls"].int().tolist()
         bboxes = detections["bboxes"]
         iou = batch_probiou(gt_bboxes, bboxes) if is_obb else box_iou(gt_bboxes, bboxes)
@@ -427,23 +503,30 @@ class ConfusionMatrix(DataExportMixin):
         n = matches.shape[0] > 0
         m0, m1, _ = matches.transpose().astype(int)
         for i, gc in enumerate(gt_classes):
-            j = m0 == i
-            if n and sum(j) == 1:
-                dc = detection_classes[m1[j].item()]
-                self.matrix[dc, gc] += 1  # TP if class is correct else both an FP and an FN
-                if dc == gc:
-                    self._append_matches("TP", detections, m1[j].item())
+            gcs = (
+                [int(gc)]
+                if gt_cls.ndim == 1 or gt_cls.shape[-1] == 1
+                else gc.nonzero(as_tuple=False).flatten().tolist()
+            )
+            for g in gcs:
+                j = m0 == i
+                if n and sum(j) == 1:
+                    dc = detection_classes[m1[j].item()]
+                    self.matrix[dc, g] += 1  # TP if class is correct else both an FP and an FN
+                    if dc == g:
+                        self._append_matches("TP", detections, m1[j].item())
+                    else:
+                        self._append_matches("FP", detections, m1[j].item())
+                        self._append_matches("FN", batch, i)
                 else:
-                    self._append_matches("FP", detections, m1[j].item())
+                    self.matrix[self.nc, g] += 1  # FN
                     self._append_matches("FN", batch, i)
-            else:
-                self.matrix[self.nc, gc] += 1  # FN
-                self._append_matches("FN", batch, i)
 
-        for i, dc in enumerate(detection_classes):
-            if not any(m1 == i):
-                self.matrix[dc, self.nc] += 1  # FP
-                self._append_matches("FP", detections, i)
+        if n:
+            for i, dc in enumerate(detection_classes):
+                if not any(m1 == i):
+                    self.matrix[dc, self.nc] += 1  # FP
+                    self._append_matches("FP", detections, i)
 
     def matrix(self):
         """Return the confusion matrix."""
@@ -792,7 +875,12 @@ def ap_per_class(
     tp, conf, pred_cls = tp[i], conf[i], pred_cls[i]
 
     # Find unique classes
-    unique_classes, nt = np.unique(target_cls, return_counts=True)
+    if target_cls.ndim == 1:
+        unique_classes, nt = np.unique(target_cls, return_counts=True)
+    elif target_cls.ndim == 2 and target_cls.shape[1] == 1 and target_cls.max() > 1:
+        unique_classes, nt = np.unique(target_cls.squeeze(1), return_counts=True)
+    else:
+        unique_classes, nt = np.unique(target_cls.nonzero()[1], return_counts=True)
     nc = unique_classes.shape[0]  # number of classes, number of detections
 
     # Create Precision-Recall curve and compute AP for each class
@@ -1120,7 +1208,12 @@ class DetMetrics(SimpleClass, DataExportMixin):
         )[2:]
         self.box.nc = len(self.names)
         self.box.update(results)
-        self.nt_per_class = np.bincount(stats["target_cls"].astype(int), minlength=len(self.names))
+        if stats["target_cls"].ndim == 1:
+            self.nt_per_class = np.bincount(stats["target_cls"].astype(int), minlength=len(self.names))
+        elif stats["target_cls"].ndim == 2 and stats["target_cls"].shape[1] == 1 and stats["target_cls"].max() > 1:
+            self.nt_per_class = np.bincount(stats["target_cls"].squeeze(1).astype(int), minlength=len(self.names))
+        else:
+            self.nt_per_class = np.bincount(stats["target_cls"].nonzero()[1], minlength=len(self.names))
         self.nt_per_image = np.bincount(stats["target_img"].astype(int), minlength=len(self.names))
         return stats
 
@@ -1166,7 +1259,10 @@ class DetMetrics(SimpleClass, DataExportMixin):
         """Return dictionary of computed performance metrics and statistics."""
         keys = [*self.keys, "fitness"]
         values = ((float(x) if hasattr(x, "item") else x) for x in ([*self.mean_results(), self.fitness]))
-        return dict(zip(keys, values))
+        out = dict(zip(keys, values))
+        if hasattr(self, "attr_map50"):
+            out["metrics/mAP50(A)"] = float(getattr(self, "attr_map50", 0.0))
+        return out
 
     @property
     def curves(self) -> list[str]:
