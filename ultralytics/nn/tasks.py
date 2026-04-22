@@ -58,7 +58,9 @@ from ultralytics.nn.modules import (
     Pose,
     Pose26,
     Pose26ReID,
+    Pose26ReIDV2,
     PoseReID,
+    PoseReIDV2,
     RepC3,
     RepConv,
     RepNCSPELAN4,
@@ -1735,13 +1737,15 @@ def parse_model(d, ch, verbose=True):
                 Pose,
                 Pose26,
                 Pose26ReID,
+                Pose26ReIDV2,
                 PoseReID,
+                PoseReIDV2,
                 OBB,
                 OBB26,
             }
         ):
             # Pose heads use (nc, kpt_shape, attr_nc, reg_max, end2end, ch); YAML only lists [nc, kpt_shape].
-            if m in {Pose, Pose26, Pose26ReID, PoseReID} and len(args) == 2:
+            if m in {Pose, Pose26, Pose26ReID, Pose26ReIDV2, PoseReID, PoseReIDV2} and len(args) == 2:
                 args.insert(2, attr_nc_yaml)
             args.extend([reg_max, end2end, [ch[x] for x in f]])
             if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
@@ -1756,7 +1760,9 @@ def parse_model(d, ch, verbose=True):
                 Pose,
                 Pose26,
                 Pose26ReID,
+                Pose26ReIDV2,
                 PoseReID,
+                PoseReIDV2,
                 OBB,
                 OBB26,
             }:
@@ -1873,7 +1879,7 @@ def guess_model_task(model):
                 return "segment"
             elif isinstance(m, Classify):
                 return "classify"
-            elif isinstance(m, (PoseReID, Pose26ReID)):
+            elif isinstance(m, (PoseReID, Pose26ReID, PoseReIDV2, Pose26ReIDV2)):
                 return "posereid"
             elif isinstance(m, Pose):
                 return "pose"

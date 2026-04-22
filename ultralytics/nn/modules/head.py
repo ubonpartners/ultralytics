@@ -746,7 +746,13 @@ class Pose(Detect):
 
 
 class ReIDAdapter(nn.Module):
-    """FiLM-modulated MLP to generate ReID embeddings."""
+    """FiLM-modulated MLP to generate ReID embeddings (v1, legacy).
+
+    Kept unchanged for back-compat with existing trained checkpoints. New models
+    should use ReIDAdapterV2 which is fp16-safe by construction.
+    """
+
+    VERSION = 1
 
     def __init__(self, in_dim=575, hidden1=160, hidden2=192, emb=80):
         super().__init__()
@@ -778,6 +784,92 @@ class ReIDAdapter(nn.Module):
         return F.normalize(emb, p=2, dim=1) * self.scale
 
 
+class ReIDAdapterV2(nn.Module):
+    """FiLM-modulated MLP to generate ReID embeddings (v2).
+
+    Changes vs v1:
+      * LayerNorm after every Linear bounds every intermediate activation to O(1)
+        independent of weight magnitudes → fp16/int8-safe by construction.
+      * SiLU instead of ReLU (smooth nonlinearity, already standard in YOLO paths).
+      * FiLM input is pre-LN'd; FiLM Linear is zero-init so the network starts
+        as identity on the features (no initial FiLM distortion).
+      * Output is pure F.normalize(..., eps=1e-4) — no self.scale parameter.
+        The scale-collapse pathology is gone because intermediates can't grow
+        unbounded to compensate for a small scale.
+      * Default embedding dim is 96 (up from 80).
+
+    Input contract (identical to v1) is [feats | scale_code] where feats has
+    width in_dim - 8 and scale_code has width up to 8 (pad if shorter).
+    """
+
+    VERSION = 2
+
+    def __init__(self, in_dim=575, hidden1=160, hidden2=192, emb=96):
+        super().__init__()
+        self.in_dim = in_dim
+        self.emb = emb
+        self.feat_dim = in_dim - 8
+
+        self.feat_ln = nn.LayerNorm(self.feat_dim)
+        self.film = nn.Linear(8, 2 * self.feat_dim)
+        nn.init.zeros_(self.film.weight)
+        nn.init.zeros_(self.film.bias)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(self.feat_dim, hidden1),
+            nn.LayerNorm(hidden1),
+            nn.SiLU(),
+            nn.Dropout(0.05),
+            nn.Linear(hidden1, hidden2),
+            nn.LayerNorm(hidden2),
+            nn.SiLU(),
+            nn.Dropout(0.05),
+            nn.Linear(hidden2, emb),
+            nn.LayerNorm(emb),
+        )
+
+    def forward(self, x):
+        feats, scale_code = x[:, : self.feat_dim], x[:, self.feat_dim :]
+        pad_len = 8 - scale_code.shape[1]
+        if pad_len > 0:
+            scale_code = F.pad(scale_code, (0, pad_len))
+        feats = self.feat_ln(feats)
+        gamma, beta = self.film(scale_code).chunk(2, dim=1)
+        feats = feats * (1 + gamma) + beta
+        emb = self.mlp(feats)
+        # eps=1e-4 is within fp16's normal range (min normal ~6e-5), so the
+        # divisor never underflows even when emb magnitude is tiny.
+        return F.normalize(emb, p=2, dim=1, eps=1e-4)
+
+
+def build_reid_adapter_from_state_dict(state_dict, device="cpu"):
+    """Instantiate the right adapter class by sniffing keys in a saved state_dict.
+
+    V2 state_dicts contain 'feat_ln.weight' and extra 'mlp.{1,4}.weight' LN layers;
+    V1 state_dicts do not. The sniff is exact, not heuristic.
+    """
+    is_v2 = "feat_ln.weight" in state_dict
+    if is_v2:
+        film_w = state_dict["film.weight"]  # [2*feat_dim, 8]
+        feat_dim = int(film_w.shape[0] // 2)
+        in_dim = feat_dim + 8
+        hidden1 = int(state_dict["mlp.0.weight"].shape[0])
+        hidden2 = int(state_dict["mlp.4.weight"].shape[0])
+        emb = int(state_dict["mlp.8.weight"].shape[0])
+        model = ReIDAdapterV2(in_dim=in_dim, hidden1=hidden1, hidden2=hidden2, emb=emb).to(device)
+    else:
+        film_w = state_dict["film.0.weight"]
+        feat_dim = int(film_w.shape[0] // 2)
+        in_dim = feat_dim + 8
+        hidden1 = int(state_dict["mlp.0.weight"].shape[0])
+        hidden2 = int(state_dict["mlp.3.weight"].shape[0])
+        emb = int(state_dict["mlp.6.weight"].shape[0])
+        model = ReIDAdapter(in_dim=in_dim, hidden1=hidden1, hidden2=hidden2, emb=emb).to(device)
+    model.load_state_dict(state_dict)
+    model.eval()
+    return model
+
+
 class PoseReID(Pose):
     """Pose head with ReID embeddings appended to predictions.
 
@@ -790,9 +882,12 @@ class PoseReID(Pose):
     FEAT_WIDTH = 512
     FEAT_PLUS_CODE = FEAT_WIDTH + CODE_LEN
 
+    # Override in subclass to pick a different adapter version. Default = v1 for back-compat.
+    REID_ADAPTER_CLS = ReIDAdapter
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.reid = ReIDAdapter(in_dim=self.nc + self.attr_nc + self.FEAT_PLUS_CODE)
+        self.reid = self.REID_ADAPTER_CLS(in_dim=self.nc + self.attr_nc + self.FEAT_PLUS_CODE)
 
     def _slice_cls_scores(self, preds, num_anchors):
         if preds.dim() != 3:
@@ -1056,9 +1151,12 @@ class Pose26ReID(Pose26):
     FEAT_WIDTH = 512
     FEAT_PLUS_CODE = FEAT_WIDTH + CODE_LEN
 
+    # Override in subclass to pick a different adapter version. Default = v1 for back-compat.
+    REID_ADAPTER_CLS = ReIDAdapter
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.reid = ReIDAdapter(in_dim=self.nc + self.attr_nc + self.FEAT_PLUS_CODE)
+        self.reid = self.REID_ADAPTER_CLS(in_dim=self.nc + self.attr_nc + self.FEAT_PLUS_CODE)
 
     def _slice_cls_scores(self, preds, num_anchors):
         if preds.dim() != 3:
@@ -1165,6 +1263,18 @@ class Pose26ReID(Pose26):
             return preds if self.export else (preds, indices)
         combined_pred = self._append_reid(x, preds)
         return combined_pred if self.export else (combined_pred, indices)
+
+
+class PoseReIDV2(PoseReID):
+    """PoseReID head using ReIDAdapterV2 (fp16-safe, emb=96)."""
+
+    REID_ADAPTER_CLS = ReIDAdapterV2
+
+
+class Pose26ReIDV2(Pose26ReID):
+    """Pose26ReID head using ReIDAdapterV2 (fp16-safe, emb=96)."""
+
+    REID_ADAPTER_CLS = ReIDAdapterV2
 
 
 class Classify(nn.Module):
