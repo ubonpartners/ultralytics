@@ -1,11 +1,12 @@
 # UBON Changes to Ultralytics YOLO
 
 This document describes the additions made to the upstream Ultralytics YOLO26 codebase in
-the `ubon` branch. The changes are organised into two features, each applied as a single
-clean git commit on top of `main`:
+the current `ubon26_wip` branch compared with upstream `main`. The branch is organised around
+two feature areas plus follow-up fixes from the current work-in-progress commits:
 
 1. **Binary attribute head** — per-detection multi-label attribute prediction
 2. **PoseReID head** — per-detection L2-normalised embedding for re-identification
+3. **E2E/ReID follow-ups** — fp16-safe ReID adapter V2 and post-top-k ReID computation
 
 Both features are fully opt-in and backward-compatible: all new config keys default to off,
 and models without `attributes: True` / `attr_nc > 0` behave identically to upstream.
@@ -152,8 +153,8 @@ All mix/spatial transforms propagate `labels["attr"]` alongside `labels["cls"]`:
 - Loss tensor extended from 3 → 4 slots when `attr_enabled`
 
 `v8PoseLoss`, `PoseLoss26`, and `v8SegmentationLoss` propagate the attribute loss slot
-(index 5 for pose with RLE, index 3 for detection, etc.) and expose `attr_loss` in
-`loss_names`.
+(index 5/6 for pose depending on whether RLE is present, index 3 for detection) and expose
+`attr_loss` in `loss_names`.
 
 **E2E uniform scaling** (`E2ELoss.__call__`): All o2m losses — including attr — are scaled
 uniformly by `self.o2m`. The o2o path never produces an attr loss (since `include_attr=False`
@@ -166,7 +167,9 @@ assignment quality for attributes.
 **`ultralytics/utils/tal.py`**
 
 `TaskAlignedAssigner` extended for multi-label `gt_labels` (last dim > 1):
-- Score gathering uses `pd_scores[:, :, active].amax()` per GT box instead of direct index
+- Score gathering uses `amax()` over active label channels instead of direct class-index lookup
+- The multi-label score path is chunked over GT rows to avoid a Python inner loop while keeping
+  temporary memory bounded
 - `get_targets` produces a multi-hot `target_scores` tensor instead of one-hot
 
 ### Inference and validation
@@ -203,6 +206,8 @@ row-index trailer and returns kept indices for feature alignment.
   training so that `flow_model` parameters participate in the forward autograd graph. This
   prevents DDP from double-marking flow_model's gradient-ready hooks when `torch.compile`
   is active (previously compile was blanket-disabled under DDP to work around this)
+- E2E resume rebuilds the criterion and restores the o2m/o2o loss schedule from the resumed
+  epoch, so the decayed one-to-many weight does not restart at the initial value.
 
 **`ultralytics/models/yolo/detect/train.py`**:
 - Passes `attr_nc=self.args.attr_nc` when constructing the detection model
@@ -216,9 +221,6 @@ row-index trailer and returns kept indices for feature alignment.
 
 These are standalone fixes unrelated to attributes but needed in the same codebase:
 
-- **AMP check** (`utils/checks.py`): replaced the network download of `yolo26n.pt` with an
-  in-process forward pass on the actual training model; handles multi-output heads and
-  tuple/dict returns
 - **DDP file** (`utils/dist.py`): wraps `main()` with `@record` from
   `torch.distributed.elastic` for better distributed error tracing
 - **`model_info()`** (`utils/torch_utils.py`): returns stats dict even when `verbose=False`
@@ -233,8 +235,9 @@ These are standalone fixes unrelated to attributes but needed in the same codeba
 
 ### What it does
 
-`PoseReID` extends `Pose` with a **FiLM-modulated MLP** (`ReIDAdapter`) that produces a
-per-detection L2-normalised embedding vector. The embedding fuses:
+`PoseReID`/`Pose26ReID` extend the pose heads with a **FiLM-modulated MLP**
+(`ReIDAdapter` or `ReIDAdapterV2`) that produces a per-detection L2-normalised embedding
+vector. The embedding fuses:
 - Per-anchor **class logits + attribute logits** from the detection head
 - Per-anchor **backbone spatial features** (padded/truncated to a fixed width)
 - A **per-scale one-hot code** (FiLM conditioning signal)
@@ -254,7 +257,7 @@ are **fused** back into the YOLO checkpoint via weight merging. This decoupled a
 
 ### Architecture
 
-**`ReIDAdapter`** (`ultralytics/nn/modules/head.py`):
+**`ReIDAdapter` and `ReIDAdapterV2`** (`ultralytics/nn/modules/head.py`):
 
 ```
 Input:  [class_scores (nc + attr_nc) | backbone_feats (FEAT_WIDTH) | scale_code (CODE_LEN)]
@@ -263,10 +266,19 @@ Feats:  feats = feats * (1 + gamma) + beta
 MLP:    Linear(nc+FEAT_WIDTH, hidden1) → ReLU → Dropout(0.05) →
         Linear(hidden1, hidden2) → ReLU → Dropout(0.05) →
         Linear(hidden2, emb_dim) → LayerNorm(emb_dim)
-Output: F.normalize(mlp_out, p=2) * scale  (learnable temperature)
+Output v1: F.normalize(mlp_out, p=2) * scale  (learnable temperature)
+Output v2: F.normalize(mlp_out, p=2, eps=1e-4)
 ```
 
-Default sizes: `FEAT_WIDTH=512`, `CODE_LEN=8`, `hidden1=160`, `hidden2=192`, `emb_dim=80`.
+Default sizes: `FEAT_WIDTH=512`, `CODE_LEN=8`, `hidden1=160`, `hidden2=192`. V1 uses
+`emb_dim=80`; V2 uses `emb_dim=96`.
+
+`ReIDAdapterV2` is the new preferred adapter for quantized/fp16 export. It keeps the same
+input contract as V1, but adds LayerNorm after every Linear, uses SiLU, zero-initialises the
+FiLM layer so it starts as identity, removes the learnable output scale, and normalises with
+`eps=1e-4` to avoid fp16 underflow. `build_reid_adapter_from_state_dict()` sniffs the state
+dict keys and instantiates either V1 or V2, preserving compatibility with existing fused
+checkpoints.
 
 The class-score input width is `nc + attr_nc` — both detection class scores and attribute
 scores are concatenated before the adapter. This is important when models are converted from
@@ -281,22 +293,19 @@ are zero-padded (if narrower) or channel-truncated (if wider) to exactly 512 bef
 concatenation. This keeps the `ReIDAdapter` weight shape constant across backbone variants.
 For a different backbone width, change `PoseReID.FEAT_WIDTH` and retrain from scratch.
 
-**`PoseReID`** (extends `Pose`):
-- `forward()` stashes `_build_reid_feats(x)` as `self._reid_feats`, then delegates to
-  `super().forward([y.clone() for y in x])`. Training mode short-circuits to the parent
-  without touching the adapter.
-- `_inference()` override runs `super()._inference(x)` (→ `[B, 4+nc+attr_nc+nk, A]`),
-  then immediately:
-  - Pops `self._reid_feats` (set by `forward()`)
-  - Runs `ReIDAdapter` on every anchor
-  - Cats the `[B, emb_dim, A]` embeddings to the tail of `y`
-- Because `_inference` runs *before* `postprocess` in both E2E and non-E2E paths, the E2E
-  top-K gather in `Detect.postprocess` automatically carries reid columns through with no
-  extra bookkeeping.
-- `postprocess()` override handles the E2E case where `Pose.postprocess` would try to split
-  on `[4, nc, attr_nc, nk]` but receives extra `emb_dim` tail columns. It strips reid,
-  calls `super().postprocess(core)`, re-gathers reid with the same top-K index, and
-  re-appends (inserting before the row-index column when `attr_nc > 0`).
+**`_PoseReIDMixin` / PoseReID heads**:
+- `forward()` clones the incoming feature maps before delegating to the parent pose head.
+  Training mode returns the parent output unchanged, so the adapter is not trained by YOLO
+  losses.
+- Non-E2E anchor-aligned inference can append ReID embeddings directly to the raw prediction
+  tensor.
+- E2E inference now computes ReID **after** `postprocess()`/top-k. `_postprocess_with_reid_after_topk`
+  runs normal pose postprocessing, recomputes the same top-k indices from the anchor scores,
+  gathers only the selected rows' class/attr scores and backbone features, runs the adapter on
+  those rows, and appends the embeddings to the final detections.
+- Export has a dedicated E2E path that rebuilds one2one inference, injects trained attributes
+  from the o2m `cv3` path when needed, and runs the same post-top-k ReID computation. This
+  avoids running the adapter across every anchor in exported E2E PoseReID models.
 
 ### Model task routing
 
@@ -309,7 +318,9 @@ task: posereid
 ```
 
 `PoseReIDModel` is a thin wrapper around `DetectionModel` that sets `kpt_shape` from the
-YAML and uses `v8PoseLoss` (ReID has no separate loss term).
+YAML and uses `v8PoseLoss` (ReID has no separate loss term). In the current workflow this is
+mainly for loading/exporting fused checkpoints; normal YOLO pose training still routes through
+`PoseTrainer`/`PoseModel`.
 
 `guess_model_task` identifies `PoseReID` heads and returns `"posereid"` so saved
 checkpoints load correctly.
@@ -362,8 +373,9 @@ The `reid` repository implements the three-phase adapter training workflow:
 1. **Feature extraction** — runs a base YOLO model over grid images of person crops; captures
    backbone feature maps via `predictor._feats` (the expanded path described above) and saves
    per-detection `[class_logits | backbone_feats | scale_one_hot]` vectors to a `.npz` file.
-2. **Triplet training** — trains `ReIDAdapter` on the saved features using hard triplet mining,
-   margin annealing, and warmup+cosine LR; evaluates Recall@K (FAISS) each epoch.
+2. **Triplet training** — trains `ReIDAdapter` or `ReIDAdapterV2` on the saved features using
+   hard triplet mining, margin annealing, and warmup+cosine LR; evaluates Recall@K (FAISS)
+   each epoch.
 3. **Fusion** — instantiates an empty PoseReID model from `reid_yaml`, copies base YOLO weights
    (exact key+shape match) and adapter weights (suffix-based match), patches task/names/kpt_shape,
    saves the fused `.pt`, and exports ONNX.
@@ -412,6 +424,13 @@ removed from a prior refactor, but the usage at lines 500–501 (multilabel path
 (standard path) remained, causing `AttributeError` for any model with per-class weights.
 Restored the initialisation (and the `.to(device).view(1, 1, -1)` reshape) in `__init__`.
 
+### 5. Pose cls/dfl gain double-scaling
+
+`v8PoseLoss.loss()` and `PoseLoss26.loss()` previously copied `det_loss[1]` and `det_loss[2]`
+after `get_assigned_targets_and_loss()` had already applied `hyp.cls`/`hyp.dfl`, then applied
+those gains again in the pose wrapper. The current branch keeps cls/dfl single-scaled and
+only applies pose-specific gains (`hyp.pose`, `hyp.kobj`, and `hyp.rle`) in the pose loss.
+
 ---
 
 ## Known limitations / future work
@@ -419,33 +438,59 @@ Restored the initialisation (and the `.to(device).view(1, 1, -1)` reshape) in `_
 1. **`YOLOAttributeDataset.cache_labels`** duplicates most of `YOLODataset.cache_labels`.
    A future refactor could add a `_process_label(lb, keypoint)` hook to the parent class.
 
-2. **TAL multi-label path** (`utils/tal.py`) uses a nested Python loop over `(bs, n_max_boxes)`.
-   Typical values (bs ≤ 16, n_max_boxes ≤ 100) make this fast enough, but a vectorised
-   gather would be preferable for large batches.
+2. **TAL multi-label path** (`utils/tal.py`) still loops over batch rows and chunks GT rows.
+   This is much better than the original nested `(bs, n_max_boxes)` loop, but a fully
+   vectorised gather/reduce could still help very large batches or dense scenes.
 
 3. **`PoseReID.FEAT_WIDTH=512`** is chosen for the yolo26s backbone. Other backbone widths
    require changing the class constant and retraining.
 
-4. **Adapter trained separately**: the `ReIDAdapter` is trained with triplet loss by the
-   companion `reid` repository (`ubonpartners/reid`), not jointly with the YOLO backbone.
+4. **Adapter trained separately**: the `ReIDAdapter`/`ReIDAdapterV2` is trained with triplet
+   loss by the companion `reid` repository (`ubonpartners/reid`), not jointly with the YOLO backbone.
    The adapter participates in inference only (skipped during `model.train()`) and is fused
    into the checkpoint after separate triplet training. Joint end-to-end fine-tuning would
    require a ReID loss term summed with `v8PoseLoss`.
 
-5. **Export**: attributes pass through ONNX/TensorRT export (columns are part of the head
-   output tensor). ReID embeddings also export cleanly. No special export handling is
-   needed.
+5. **Export**: attributes pass through ONNX/TensorRT export as normal output columns. E2E
+   PoseReID export has special handling to compute ReID after top-k so export-time FLOPs stay
+   proportional to `max_det` rather than the number of anchors.
 
 6. **Attr bias initialisation**: `Detect.bias_init` initialises cls logit biases (indices
    `0:nc`) but does not explicitly initialise attr biases (indices `nc:nc+attr_nc`). They
    remain at zero (sigmoid → 0.5), which is a reasonable starting point for binary
    attributes but may benefit from a task-specific prior.
 
-7. **Double cls/dfl gain scaling in PoseLoss**: `v8PoseLoss.loss()` and `PoseLoss26.loss()`
-   assign `det_loss[1]` (cls, already scaled by `hyp.cls` in `get_assigned_targets_and_loss`)
-   then multiply by `hyp.cls` again. This is upstream behaviour — hyp values for pose tasks
-   are tuned with this double-scaling in mind. The attr loss slot does NOT double-scale
-   (single-scaled from `get_assigned_targets_and_loss`), matching the box loss behaviour.
+7. **E2E attributes are trained only through one-to-many**: this is intentional because the
+   one-to-one assignment is unstable early in training, but it means the attribute signal
+   decays with the o2m schedule and never receives o2o reinforcement.
+
+---
+
+## Suggestions from current review
+
+1. **Mirror `PoseModel.init_criterion()` in `PoseReIDModel` before enabling direct PoseReID training.**
+   `PoseReIDModel.init_criterion()` currently returns plain `v8PoseLoss(self)` regardless of
+   `end2end` or whether the head is `Pose26ReID`. That is fine for the current load/export
+   workflow where the ReID adapter is trained separately, but direct `task=posereid` training
+   would miss `E2ELoss` and `PoseLoss26`/RLE behavior. If direct PoseReID training is intended,
+   make it select `PoseLoss26` for `Pose26*` heads and wrap with `E2ELoss` when `end2end=True`.
+
+2. **Watch attribute under-training late in E2E schedules.** Attributes are deliberately
+   excluded from one-to-one loss and get `attr_o2m * self.o2m`. With `final_o2m=0.1`, the
+   attribute gradient falls to 10% while box/cls/dfl are partly replaced by o2o signal. If
+   validation shows attribute AP flattening or regressing late, consider an attribute-specific
+   o2m floor or a late attr-only fine-tune while keeping the current default conservative.
+
+3. **Add a small e2e regression test for output layout and gradients.** The critical contract is
+   that training `one2one` has no `attr`, inference injects trained o2m attributes, postprocess
+   appends a row index only when attrs are present, and PoseReID embeddings sit before that row
+   index. A CPU smoke test with a tiny E2E attribute pose model would catch many future shape
+   regressions without needing a full training run.
+
+4. **Consider removing the first-batch `.item()` attr-label warning from hot loss code.** The
+   one-time check is useful while debugging datasets, but it still introduces a CPU sync on the
+   first attribute batch. If compile/cuda-graph cleanliness becomes important, move this check
+   to dataset validation or guard it behind a debug flag.
 
 ---
 
@@ -460,19 +505,19 @@ Restored the initialisation (and the `.to(device).view(1, 1, -1)` reshape) in `_
 | `ultralytics/data/base.py` | Dataset: filter attr in update_labels |
 | `ultralytics/data/build.py` | Dataset: select YOLOAttributeDataset when attributes=True |
 | `ultralytics/data/utils.py` | Dataset: verify_image_label accepts attr_len |
-| `ultralytics/nn/modules/head.py` | Head: attr_nc in Detect/Pose/Pose26; ReIDAdapter; PoseReID |
-| `ultralytics/nn/modules/__init__.py` | Head: export PoseReID |
+| `ultralytics/nn/modules/head.py` | Head: attr_nc in Detect/Pose/Pose26; ReIDAdapter/V2; PoseReID/Pose26ReID; post-top-k E2E ReID |
+| `ultralytics/nn/modules/__init__.py` | Head: export PoseReID/Pose26ReID variants |
 | `ultralytics/nn/tasks.py` | Model: parse_model attr_nc injection; PoseReIDModel |
 | `ultralytics/engine/results.py` | Results: attributes, reid_embeddings; kpt visibility fix |
-| `ultralytics/engine/trainer.py` | Train: sync attr args from data YAML; DDP compile fix |
+| `ultralytics/engine/trainer.py` | Train: sync attr args from data YAML; DDP compile fix; resume E2E o2m/o2o schedule |
 | `ultralytics/engine/validator.py` | Val: minor attr pass-through |
-| `ultralytics/engine/exporter.py` | Export: minor import additions |
+| `ultralytics/engine/exporter.py` | Export: ReID/attribute compatibility plumbing |
 | `ultralytics/engine/model.py` | Model: minor |
 | `ultralytics/models/yolo/model.py` | Model: posereid task routing |
 | `ultralytics/models/yolo/detect/predict.py` | Predict: attr in construct_result; expanded get_obj_feats |
 | `ultralytics/models/yolo/detect/train.py` | Train: attr_nc in model build; attr_names |
 | `ultralytics/models/yolo/detect/val.py` | Val: attr_nc row-index strip; nc fix |
-| `ultralytics/models/yolo/pose/predict.py` | Predict: attr slice; PoseReIDPredictor |
+| `ultralytics/models/yolo/pose/predict.py` | Predict: attr slice; dynamic PoseReID embedding extraction |
 | `ultralytics/models/yolo/pose/train.py` | Train: attr_nc; loss_names |
 | `ultralytics/models/yolo/pose/val.py` | Val: attr_nc strip; FACEPOSE_SIGMA; pbatch rows |
 | `ultralytics/models/yolo/pose/__init__.py` | Init: export PoseReIDPredictor |
@@ -485,9 +530,8 @@ Restored the initialisation (and the `.to(device).view(1, 1, -1)` reshape) in `_
 | `ultralytics/utils/loss.py` | Loss: attr BCE; multilabel assigner path; FACEPOSE sigmas import; bug fixes |
 | `ultralytics/utils/metrics.py` | Metrics: FACEPOSE/FACEPOSEBOX sigmas; multi-label ConfusionMatrix |
 | `ultralytics/utils/nms.py` | NMS: return_idxs E2E row-index path |
-| `ultralytics/utils/tal.py` | TAL: multi-label score gathering and target assignment |
+| `ultralytics/utils/tal.py` | TAL: chunked multi-label score gathering and target assignment |
 | `ultralytics/utils/plotting.py` | Plot: handle 2D cls array from attribute dataset |
-| `ultralytics/utils/checks.py` | Infra: AMP check refactor |
 | `ultralytics/utils/dist.py` | Infra: @record DDP wrapper |
 | `ultralytics/utils/torch_utils.py` | Infra: model_info always returns stats |
 | `ultralytics/utils/callbacks/comet.py` | Infra: minor logging update |
