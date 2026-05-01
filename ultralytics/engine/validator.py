@@ -152,8 +152,12 @@ class BaseValidator:
             model = trainer.ema.ema or trainer.model
             if trainer.args.compile and hasattr(model, "_orig_mod"):
                 model = model._orig_mod  # validate non-compiled original model to avoid issues
+            # QAT models can't run in FP16 — modelopt amax buffers and weight quant kernels are FP32.
+            if self.args.half and hasattr(model, "_modelopt_state"):
+                LOGGER.warning("QAT model detected during training-mode val; forcing FP32.")
+                self.args.half = False
             model = model.half() if self.args.half else model.float()
-            self.loss = torch.zeros_like(trainer.loss_items, device=trainer.device)
+            self.loss = None
             self.args.plots &= trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)
             model.eval()
         else:
@@ -238,7 +242,8 @@ class BaseValidator:
             # Loss
             with dt[2]:
                 if self.training:
-                    self.loss += model.loss(batch, preds)[1]
+                    loss_items = model.loss(batch, preds)[1]
+                    self.loss = loss_items if self.loss is None else self.loss + loss_items
 
             # Postprocess
             with dt[3]:

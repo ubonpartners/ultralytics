@@ -8,6 +8,7 @@ import math
 import os
 import random
 import time
+import warnings
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime
@@ -45,6 +46,7 @@ TORCH_2_0 = check_version(TORCH_VERSION, "2.0.0")
 TORCH_2_1 = check_version(TORCH_VERSION, "2.1.0")
 TORCH_2_3 = check_version(TORCH_VERSION, "2.3.0")
 TORCH_2_4 = check_version(TORCH_VERSION, "2.4.0")
+TORCH_2_6 = check_version(TORCH_VERSION, "2.6.0")
 TORCH_2_8 = check_version(TORCH_VERSION, "2.8.0")
 TORCH_2_9 = check_version(TORCH_VERSION, "2.9.0")
 TORCH_2_10 = check_version(TORCH_VERSION, "2.10.0")
@@ -738,9 +740,10 @@ def strip_optimizer(f: str | Path = "best.pt", s: str = "", updates: dict[str, A
         x["model"].args = dict(x["model"].args)  # convert from IterableSimpleNamespace to dict
     if hasattr(x["model"], "criterion"):
         x["model"].criterion = None  # strip loss criterion
-    x["model"].half()  # to FP16
-    for p in x["model"].parameters():
-        p.requires_grad = False
+    if "state_dict" not in x:  # QAT checkpoints store weights under state_dict and ema=None
+        x["model"].half()  # to FP16
+        for p in x["model"].parameters():
+            p.requires_grad = False
 
     # Update other keys
     args = {**DEFAULT_CFG_DICT, **x.get("train_args", {})}  # combine args
@@ -1018,3 +1021,28 @@ def attempt_compile(
     else:
         LOGGER.info(f"{prefix} compile complete in {t_compile:.1f}s (no warmup)")
     return model
+
+
+def setup_modelopt():
+    """Set up NVIDIA Model Optimizer for QAT and silence its noisy logs.
+
+    Asserts the runtime supports QAT (Torch >= 2.6, Python >= 3.10), installs
+    `nvidia-modelopt` if missing, and suppresses cpp-extension/conversion stdout
+    plus deprecation warnings emitted by modelopt.
+    """
+    from ultralytics.utils.checks import IS_PYTHON_MINIMUM_3_10, check_requirements
+
+    assert TORCH_2_6, "QAT requires PyTorch>=2.6"
+    assert IS_PYTHON_MINIMUM_3_10, "QAT requires Python>=3.10"
+
+    check_requirements("nvidia-modelopt")
+
+    import logging
+
+    import modelopt.torch.quantization as mtq
+    import modelopt.torch.utils as mtu
+
+    # suppress noisy modelopt prints / warnings
+    mtu.cpp_extension.print = mtq.conversion.print = lambda *a, **kw: None
+    warnings.filterwarnings("ignore", module="modelopt")
+    logging.getLogger("torch.utils.cpp_extension").setLevel(logging.ERROR)

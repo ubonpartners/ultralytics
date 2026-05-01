@@ -2,14 +2,15 @@
 
 This document describes the additions made to the upstream Ultralytics YOLO26 codebase in
 the current `ubon26_wip` branch compared with upstream `main`. The branch is organised around
-two feature areas plus follow-up fixes from the current work-in-progress commits:
+three feature areas plus follow-up fixes from the current work-in-progress commits:
 
 1. **Binary attribute head** — per-detection multi-label attribute prediction
 2. **PoseReID head** — per-detection L2-normalised embedding for re-identification
 3. **E2E/ReID follow-ups** — fp16-safe ReID adapter V2 and post-top-k ReID computation
+4. **QAT (Quantization-Aware Training)** — INT8 fine-tuning via NVIDIA Model Optimizer with explicit-Q/DQ ONNX/TensorRT export
 
-Both features are fully opt-in and backward-compatible: all new config keys default to off,
-and models without `attributes: True` / `attr_nc > 0` behave identically to upstream.
+All features are fully opt-in and backward-compatible: all new config keys default to off,
+and models without `attributes: True` / `attr_nc > 0` / `int8: True` behave identically to upstream.
 
 ---
 
@@ -381,6 +382,94 @@ The `reid` repository implements the three-phase adapter training workflow:
    saves the fused `.pt`, and exports ONNX.
 
 See the `reid` repository README for full configuration, dataset loaders, and CLI usage.
+
+---
+
+## 4. QAT (Quantization-Aware Training)
+
+### What it does
+
+Fine-tunes an existing FP32/FP16 checkpoint with NVIDIA Model Optimizer Q/DQ
+wrappers inserted (INT8 per-channel weights, per-tensor activations, DFL
+excluded). The resulting `.pt` round-trips Q/DQ state so re-training, REID
+fusion, and ONNX/TensorRT export all "just work" without a separate PTQ
+calibration pass at engine-build time.
+
+Replaces the previous off-the-side `quant/make_int8.py` PTQ workflow:
+
+* PTQ ran on the **fused** FP32 checkpoint, so the REID adapter (trained
+  pre-PTQ on the **un-fused** backbone) saw a different feature distribution
+  than the deployed engine.
+* QAT runs end-to-end on the same training pipeline, sees real labelled data,
+  and lets REID re-fusion happen on a Q/DQ checkpoint so the adapter is
+  trained against the same fake-quant statistics it will see at inference.
+
+Full design notes and operational caveats live in `UBON_QAT.md`.
+
+### How to use
+
+```python
+model = YOLO("yolo26l-attr.pt")
+model.train(
+    data="coco.yaml",
+    epochs=5,
+    int8=True,                  # ← enables QAT
+    lr0=1e-4,
+    val_at_start=True,          # baseline metrics on the freshly-calibrated model
+    qat_calib_method="max",     # max | percentile | mse | entropy
+    qat_calib_samples=4096,     # per-rank cap; total = samples * world_size
+)
+# Re-load and export
+model = YOLO("runs/detect/train/weights/best.pt")
+model.export(format="engine", int8=True, imgsz=640)
+```
+
+### New config keys (`ultralytics/cfg/default.yaml`)
+
+| Key | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `val_at_start` | bool | `False` | Run validation on initial weights before any training step (epoch 0). Useful for fine-tune / QAT to baseline metrics. Skipped on resume. |
+| `qat_freeze_bn` | bool | `False` | Keep BatchNorm running statistics frozen during QAT. Recommended when the source checkpoint is fully converged. |
+| `qat_exclude` | list[str] | _unset_ | Glob-substring patterns matching module name fragments to skip Q/DQ insertion (e.g. `["model.23"]`). |
+| `qat_calib_samples` | int | `4096` | Per-rank calibration sample cap. |
+| `qat_calib_data` | str | _unset_ | Override calibration data source. Defaults to `data["train"]` with val-mode preprocessing. |
+| `qat_calib_method` | str | `max` | Activation calibration method: `max` \| `percentile` \| `mse` \| `entropy`. |
+| `qat_calib_percentile` | float | `99.9` | Percentile clip for activation amax (used with `qat_calib_method=percentile`). |
+
+Plus a new `data:` YAML key (not a CLI key):
+
+| Key | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `train_subsample` | int | `1` | Stride-based sampling on multi-source train lists. Keeps every Nth image after concatenation, so each source contributes uniformly (unlike `fraction`, which is a deterministic prefix slice that biases toward the first datasets). The label cache key includes the stride to avoid thrashing when stride changes. |
+
+### Files modified
+
+| File | Change |
+| --- | --- |
+| `ultralytics/cfg/default.yaml` | Add the seven keys above. |
+| `ultralytics/utils/torch_utils.py` | Add `TORCH_2_6` constant and `setup_modelopt()` (lazy install + log suppression). `strip_optimizer` skips `.half()` / `requires_grad=False` on QAT ckpts. |
+| `ultralytics/engine/trainer.py` | Add `build_quantized_model()` (insert Q/DQ, calibrate, DDP amax sync, disable unexercised quantizers). Hook into `_setup_train()` to insert Q/DQ + disable mosaic/mixup/cutmix/copy_paste/close_mosaic + skip the E2E `criterion.update()`. Add optional `val_at_start` epoch-0 validation. Add `qat_freeze_bn` to BN freeze logic. `save_model()` writes a QAT-aware checkpoint when the EMA module carries `_modelopt_state` (persists `modelopt_state`, `state_dict`, `model_class`, `yaml`, head metadata; sets `ema = None` because TensorQuantizer wrappers are not picklable). |
+| `ultralytics/engine/validator.py` | Lazy-init `self.loss` in training-mode val so `val_at_start` works before `trainer.loss_items` is populated. Force FP32 when validating a QAT model with `args.half=True`. |
+| `ultralytics/engine/exporter.py` | Detect QAT structurally (`model._modelopt_state[0][0] == "quantize"`). Move model + dummy input to CPU for ONNX export (modelopt tracing path). Pass `dataset=None` to the TRT engine builder when QAT, skipping PTQ calibration. |
+| `ultralytics/utils/export/engine.py` | Only assign `int8_calibrator` when a calibration dataset is provided; explicit-Q/DQ ONNX flows through TensorRT untouched. |
+| `ultralytics/utils/loss.py` | `E2ELoss.__init__`: pin `o2m = final_o2m` when `int8=True` so QAT skips the o2m→final_o2m warmup the source checkpoint already finished. |
+| `ultralytics/nn/tasks.py` | `BaseModel.fuse()` no-ops on QAT models (cannot Conv+BN fuse a Q/DQ-wrapped graph). `load_checkpoint()` rebuilds the bare module from `model_class(yaml)` + UBON head metadata, calls `mto.restore_from_modelopt_state`, optionally applies a `reid_promotion` descriptor (head class swap + ReIDAdapter graft for QAT-then-REID-fused checkpoints), then `load_state_dict` under `torch.no_grad()`. |
+| `ultralytics/nn/backends/pytorch.py` | Force FP32 on QAT models in `PyTorchBackend.load_model()` even when the caller asks for FP16. |
+| `ultralytics/data/build.py`, `ultralytics/data/dataset.py` | New `train_subsample` data-yaml key. Cache file name includes the stride. |
+| `ultralytics/models/yolo/detect/train.py` | Apply `args.end2end` to the model when set, so QAT calibration sees a consistent end2end branch on every rank. |
+
+### Compatibility notes
+
+* Non-QAT runs are unaffected: all new code paths are gated on
+  `args.int8 == True` or `hasattr(model, "_modelopt_state")`.
+* Standard checkpoints serialize byte-for-byte unchanged.
+* QAT checkpoints have `model = None`, `ema = None`, and a populated `state_dict`
+  / `modelopt_state` / `model_class` / `yaml` block — opening one with a loader
+  that doesn't recognise the QAT layout will fail loudly rather than silently
+  dropping Q/DQ scales.
+* `nvidia-modelopt` is a soft dependency: imported only inside
+  `setup_modelopt()`, which is only called when `int8=True` is set on a
+  trainer or when loading a QAT checkpoint.
 
 ---
 

@@ -64,6 +64,14 @@ class PyTorchBackend(BaseBackend):
         self.stride = max(int(model.stride.max()), 32) if hasattr(model, "stride") else 32
         self.names = model.module.names if hasattr(model, "module") else getattr(model, "names", {})
         self.channels = model.yaml.get("channels", 3) if hasattr(model, "yaml") else 3
+        # QAT models keep modelopt's TensorQuantizer wrappers active; their amax buffers
+        # and per-channel weight kernels expect FP32. Calling .half() on such a model
+        # silently produces wrong outputs. Force FP32 and warn the user.
+        if self.fp16 and hasattr(model, "_modelopt_state"):
+            from ultralytics.utils import LOGGER
+
+            LOGGER.warning("QAT model detected (carries _modelopt_state); disabling fp16 inference.")
+            self.fp16 = False
         model.half() if self.fp16 else model.float()
 
         for p in model.parameters():

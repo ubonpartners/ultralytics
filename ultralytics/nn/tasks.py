@@ -234,7 +234,8 @@ class BaseModel(torch.nn.Module):
         Returns:
             (torch.nn.Module): The fused model is returned.
         """
-        if not self.is_fused():
+        # QAT models hold Q/DQ wrappers around Conv/BN; fusing would corrupt the calibrated graph.
+        if not self.is_fused() and not hasattr(self, "_modelopt_state"):
             for m in self.model.modules():
                 if isinstance(m, (Conv, Conv2, DWConv)) and hasattr(m, "bn"):
                     if isinstance(m, Conv2):
@@ -1556,7 +1557,65 @@ def load_checkpoint(weight, device=None, inplace=True, fuse=False):
     """
     ckpt, weight = torch_safe_load(weight)  # load ckpt
     args = {**DEFAULT_CFG_DICT, **(ckpt.get("train_args", {}))}  # combine model and default args, preferring model args
-    model = (ckpt.get("ema") or ckpt["model"]).float()  # FP32 model
+
+    if "modelopt_state" in ckpt:  # QAT checkpoint — rebuild bare module + restore Q/DQ
+        from ultralytics.utils.torch_utils import setup_modelopt
+
+        setup_modelopt()
+        import modelopt.torch.opt as mto
+
+        model = ckpt["model_class"](ckpt["yaml"], verbose=False)
+        model.names = ckpt["names"]
+        model.nc = ckpt["nc"]
+        model.yaml = ckpt["yaml"]
+        # Reattach UBON-specific head metadata if present in the QAT extras.
+        for attr in ("attr_nc", "attr_names", "attr_ncs", "kpt_shape", "task"):
+            if attr in ckpt:
+                setattr(model, attr, ckpt[attr])
+        # Optional REID-promotion descriptor. Keep the original QAT graph intact while
+        # ModelOpt restores quantizers, then graft the unquantized ReID adapter before
+        # loading the fused state_dict. Promoting before ModelOpt restore makes the
+        # wildcard quantization config create fresh adapter quantizers that are not in
+        # the saved quantizer metadata, causing "Extra keys in quantizer state_dict".
+        promo = ckpt.get("reid_promotion")
+        def apply_reid_promotion():
+            from ultralytics.nn.modules.head import (
+                Pose,
+                Pose26,
+                Pose26ReID,
+                Pose26ReIDV2,
+                PoseReID,
+                PoseReIDV2,
+                ReIDAdapter,
+                ReIDAdapterV2,
+            )
+
+            head_cls_lookup = {
+                "PoseReID": PoseReID,
+                "PoseReIDV2": PoseReIDV2,
+                "Pose26ReID": Pose26ReID,
+                "Pose26ReIDV2": Pose26ReIDV2,
+            }
+            adapter_cls_lookup = {
+                "ReIDAdapter": ReIDAdapter,
+                "ReIDAdapterV2": ReIDAdapterV2,
+            }
+            head = model.model[-1]
+            new_head_cls = head_cls_lookup[promo["head_cls_name"]]
+            adapter_cls = adapter_cls_lookup[promo["adapter_cls_name"]]
+            if isinstance(head, (Pose, Pose26)) and not isinstance(head, (PoseReID, Pose26ReID)):
+                head.__class__ = new_head_cls
+            elif isinstance(head, (PoseReID, Pose26ReID)) and head.__class__ is not new_head_cls:
+                head.__class__ = new_head_cls
+            head.reid = adapter_cls(in_dim=int(promo["in_dim"]), emb=int(promo["emb"]))
+        with torch.no_grad():
+            mto.restore_from_modelopt_state(model, ckpt["modelopt_state"])
+            if promo:
+                apply_reid_promotion()
+            model.load_state_dict(ckpt["state_dict"])
+        model = model.float()
+    else:
+        model = (ckpt.get("ema") or ckpt["model"]).float()  # FP32 model
 
     # Model compatibility updates
     model.args = args  # attach args to model

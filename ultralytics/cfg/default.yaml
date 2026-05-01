@@ -51,6 +51,7 @@ attr_nc: 0 # (int) number of attribute classes
 
 # Val/Test settings ----------------------------------------------------------------------------------------------------
 val: True # (bool) run validation/testing during training
+val_at_start: False # (bool) run validation once before any training step (epoch 0); useful for fine-tune / QAT to baseline initial weights
 split: val # (str) dataset split to evaluate: 'val', 'test' or 'train'
 save_json: False # (bool) save results to COCO JSON for external evaluation
 conf: # (float, optional) confidence threshold; defaults: predict=0.25, val=0.001
@@ -88,6 +89,12 @@ format: torchscript # (str) target format, e.g. torchscript|onnx|openvino|engine
 keras: False # (bool) TF SavedModel only (format=saved_model); enable Keras layers during export
 optimize: False # (bool) TorchScript only; apply mobile optimizations to the scripted model
 int8: False # (bool) INT8/PTQ where supported (openvino, engine, coreml, tflite, tfjs, mnn, imx, axelera); needs calibration data/fraction
+qat_freeze_bn: False # (bool) QAT only; keep BatchNorm running statistics frozen during fine-tuning
+qat_exclude: # (list[str], optional) QAT only; glob-substring patterns matching module name fragments to skip Q/DQ insertion (e.g. ["model.23"])
+qat_calib_samples: # (int, optional) QAT only; per-rank calibration sample cap (total = this * world_size); default 4096
+qat_calib_data: # (str, optional) QAT only; override calibration data source (path/yaml); defaults to train data with val-mode preprocessing
+qat_calib_method: # (str, optional) QAT only; activation calibration method: max|percentile|mse|entropy. Default max.
+qat_calib_percentile: # (float, optional) QAT only; percentile clip for activation amax (used when qat_calib_method=percentile). Default 99.9.
 dynamic: False # (bool) dynamic shapes for torchscript, onnx, openvino, engine, coreml; enable variable image sizes
 simplify: True # (bool) ONNX/engine only; run graph simplifier for cleaner ONNX before runtime conversion
 opset: # (int, optional) ONNX/engine only; opset version for export; leave unset to use a tested default

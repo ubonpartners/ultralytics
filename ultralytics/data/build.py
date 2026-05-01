@@ -247,6 +247,10 @@ def build_yolo_dataset(
     val_subsample = int(data.get("subsample", 1) or 1) if mode == "val" else 1
     if mode == "val" and val_subsample > 1:
         LOGGER.info(f"Using validation subsample stride={val_subsample} (keeping every {val_subsample}th image).")
+    train_subsample = int(data.get("train_subsample", 1) or 1) if mode == "train" else 1
+    if mode == "train" and train_subsample > 1:
+        LOGGER.info(f"Using training subsample stride={train_subsample} (keeping every {train_subsample}th image).")
+    sample_stride = train_subsample if mode == "train" else val_subsample
 
     if attributes:
         LOGGER.info("Using attribute dataset.")
@@ -271,7 +275,7 @@ def build_yolo_dataset(
         classes=cfg.classes,
         data=data,
         fraction=cfg.fraction if mode == "train" else 1.0,
-        sample_stride=val_subsample,
+        sample_stride=sample_stride,
         attributes=attributes,
         attr_nc=attr_nc,
         attr_label_format=attr_label_format,

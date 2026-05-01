@@ -259,11 +259,14 @@ def onnx2engine(
                 """Write calibration cache to disk."""
                 _ = self.cache.write_bytes(cache)
 
-        # Load dataset w/ builder (for batching) and calibrate
-        config.int8_calibrator = EngineCalibrator(
-            dataset=dataset,
-            cache=str(Path(onnx_file).with_suffix(".cache")),
-        )
+        # Load dataset w/ builder (for batching) and calibrate.
+        # When `dataset is None` the ONNX is expected to carry explicit Q/DQ scales
+        # (QAT path); TensorRT then reads them from the graph and no calibrator runs.
+        if dataset is not None:
+            config.int8_calibrator = EngineCalibrator(
+                dataset=dataset,
+                cache=str(Path(onnx_file).with_suffix(".cache")),
+            )
 
     elif half:
         config.set_flag(trt.BuilderFlag.FP16)

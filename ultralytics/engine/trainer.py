@@ -309,8 +309,23 @@ class BaseTrainer:
     def _setup_train(self):
         """Configure model, optimizer, dataloaders, and training utilities before the training loop."""
         ckpt = self.setup_model()
-        self.model = self.model.to(self.device)
         self.set_model_attributes()
+
+        # QAT: insert Q/DQ layers when int8=True for training (PTQ export path uses int8 too,
+        # but this hook only fires from a trainer; exporters never call _setup_train).
+        if getattr(self.args, "int8", False) and not hasattr(self.model, "_modelopt_state"):
+            self.build_quantized_model()
+
+        if getattr(self.args, "int8", False):
+            for aug in ("mosaic", "mixup", "cutmix", "copy_paste"):
+                if getattr(self.args, aug, 0.0):
+                    LOGGER.info(f"{colorstr('QAT:')} disabling {aug} augmentation")
+                    setattr(self.args, aug, 0.0)
+            if getattr(self.args, "close_mosaic", 0):
+                LOGGER.info(f"{colorstr('QAT:')} disabling close_mosaic")
+                self.args.close_mosaic = 0
+
+        self.model = self.model.to(self.device)
 
         # Compile model
         self.model = attempt_compile(self.model, device=self.device, mode=self.args.compile)
@@ -402,6 +417,22 @@ class BaseTrainer:
         epoch = self.start_epoch
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
         self._oom_retries = 0  # OOM auto-reduce counter for first epoch
+
+        # Optional epoch-0 validation: report initial-weights metrics before any
+        # training step. Used by fine_tune / qat modes to baseline the loaded
+        # checkpoint (and, for QAT, the post-calibration fake-quant model) so
+        # later-epoch deltas are interpretable. Skipped on resume since we'd be
+        # re-validating an already-validated checkpoint.
+        if getattr(self.args, "val_at_start", False) and self.start_epoch == 0:
+            self.epoch = epoch
+            if not hasattr(self, "loss") or self.loss is None:
+                self.loss = torch.tensor(0.0, device=self.device)
+            if not hasattr(self, "loss_items") or self.loss_items is None:
+                self.loss_items = torch.zeros(len(self.loss_names), device=self.device)
+            self._clear_memory(None if self.device.type == "mps" else 0.5)
+            LOGGER.info(f"{colorstr('val_at_start:')} Running validation on initial weights")
+            self.metrics, self.fitness = self.validate()
+
         while True:
             self.epoch = epoch
             self.run_callbacks("on_train_epoch_start")
@@ -520,7 +551,7 @@ class BaseTrainer:
             if self._oom_retries and not self.stop:
                 continue  # OOM recovery broke the for loop, restart with reduced batch size
 
-            if hasattr(unwrap_model(self.model).criterion, "update"):
+            if hasattr(unwrap_model(self.model).criterion, "update") and not getattr(self.args, "int8", False):
                 unwrap_model(self.model).criterion.update()
 
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
@@ -638,17 +669,52 @@ class BaseTrainer:
         self.model.train()
         # Freeze BN stat
         for n, m in self.model.named_modules():
-            if any(filter(lambda f: f in n, self.freeze_layer_names)) and isinstance(m, nn.BatchNorm2d):
+            if isinstance(m, nn.BatchNorm2d) and (
+                getattr(self.args, "qat_freeze_bn", False) or any(filter(lambda f: f in n, self.freeze_layer_names))
+            ):
                 m.eval()
 
     def save_model(self):
         """Save model training checkpoints with additional metadata."""
         import io
 
-        ema = deepcopy(unwrap_model(self.ema.ema)).half()
-        if not all(torch.isfinite(v).all() for v in ema.state_dict().values() if isinstance(v, torch.Tensor)):
-            LOGGER.warning(f"Skipping checkpoint save at epoch {self.epoch}: EMA contains NaN/Inf")
-            return False
+        ema_unwrapped = deepcopy(unwrap_model(self.ema.ema))
+        is_qat = hasattr(ema_unwrapped, "_modelopt_state")
+
+        if is_qat:
+            # QAT models cannot be pickled directly; persist modelopt_state + state_dict
+            # plus the metadata needed to rebuild the bare module on load.
+            import modelopt.torch.opt as mto
+
+            extras = {
+                "modelopt_state": mto.modelopt_state(ema_unwrapped),
+                "state_dict": ema_unwrapped.state_dict(),
+                "model_class": ema_unwrapped.__class__,
+                "yaml": ema_unwrapped.yaml,
+                "names": ema_unwrapped.names,
+                "nc": ema_unwrapped.nc,
+            }
+            # Preserve UBON-specific head attributes so attr/reid heads can be reconstructed.
+            for attr in ("attr_nc", "attr_names", "attr_ncs", "kpt_shape", "task"):
+                if hasattr(ema_unwrapped, attr):
+                    extras[attr] = getattr(ema_unwrapped, attr)
+            # Validate finite weights across the live state dict (no .half() in QAT).
+            if not all(
+                torch.isfinite(v).all()
+                for v in extras["state_dict"].values()
+                if isinstance(v, torch.Tensor) and v.dtype.is_floating_point
+            ):
+                LOGGER.warning(f"Skipping QAT checkpoint save at epoch {self.epoch}: state_dict contains NaN/Inf")
+                return False
+            ema_payload = None  # ema slot stays None; QAT model lives in extras
+        else:
+            ema_payload = ema_unwrapped.half()
+            if not all(
+                torch.isfinite(v).all() for v in ema_payload.state_dict().values() if isinstance(v, torch.Tensor)
+            ):
+                LOGGER.warning(f"Skipping checkpoint save at epoch {self.epoch}: EMA contains NaN/Inf")
+                return False
+            extras = {}
 
         # Serialize ckpt to a byte buffer once (faster than repeated torch.save() calls)
         buffer = io.BytesIO()
@@ -656,8 +722,8 @@ class BaseTrainer:
             {
                 "epoch": self.epoch,
                 "best_fitness": self.best_fitness,
-                "model": None,  # resume and final checkpoints derive from EMA
-                "ema": ema,
+                "model": None,  # resume and final checkpoints derive from EMA / QAT extras
+                "ema": ema_payload,
                 "updates": self.ema.updates,
                 "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
                 "scaler": self.scaler.state_dict(),
@@ -674,6 +740,7 @@ class BaseTrainer:
                 },
                 "license": "AGPL-3.0 (https://ultralytics.com/license)",
                 "docs": "https://docs.ultralytics.com",
+                **extras,
             },
             buffer,
         )
@@ -777,6 +844,214 @@ class BaseTrainer:
         if not self.best_fitness or self.best_fitness < fitness:
             self.best_fitness = fitness
         return metrics, fitness
+
+    def build_quantized_model(self):
+        """Insert Q/DQ layers into ``self.model`` for Quantization-Aware Training.
+
+        Uses NVIDIA Model Optimizer (`modelopt.torch.quantization`) with INT8
+        per-channel weights / per-tensor activations. DFL layers are excluded
+        because they are pure post-processing and quantize poorly. Calibration
+        runs on up to 512 val-set images using the per-trainer ``preprocess_batch``
+        hook so QAT works for detect/segment/pose/obb (and UBON's attr/reid head)
+        without further branching.
+        """
+        from ultralytics.utils.torch_utils import setup_modelopt
+
+        setup_modelopt()
+        import modelopt.torch.quantization as mtq
+        from modelopt.torch.quantization.calib import HistogramCalibrator
+        from modelopt.torch.quantization.model_calib import enable_stats_collection
+        from modelopt.torch.quantization.nn import TensorQuantizer
+
+        # Activation calibration method: "max" matches modelopt's default and the
+        # prior PTQ pipeline (see quant/make_int8.py). Other methods remain opt-in.
+        calib_method = str(getattr(self.args, "qat_calib_method", None) or "max").lower()
+        calib_percentile = float(getattr(self.args, "qat_calib_percentile", None) or 99.9)
+        if calib_method not in {"max", "percentile", "mse", "entropy"}:
+            raise ValueError(
+                f"qat_calib_method='{calib_method}' not supported; use one of max|percentile|mse|entropy"
+            )
+        # Percentile/entropy require per-tensor histograms; modelopt's default
+        # MaxCalibrator can't compute them. Replace activation calibrators below.
+        use_histogram = calib_method in {"percentile", "entropy", "mse"}
+
+        base_cfg = deepcopy(getattr(mtq, "INT8_DEFAULT_CFG", {"quant_cfg": {}}))
+        quant_cfg = deepcopy(base_cfg.get("quant_cfg", {}))
+
+        def update_quant_cfg(pattern: str, values: dict) -> None:
+            cfg = dict(quant_cfg.get(pattern, {}))
+            cfg.update(values)
+            quant_cfg[pattern] = cfg
+
+        # Start from ModelOpt's TensorRT-friendly INT8 defaults. Keep output
+        # quantizers disabled globally; they tend to over-constrain CNN graphs and
+        # can block TensorRT fusion. Use FP16 as the high-precision side of Q/DQ
+        # because deployment engines are built with INT8+FP16.
+        update_quant_cfg(
+            "*weight_quantizer", {"num_bits": 8, "axis": 0, "trt_high_precision_dtype": "Float"}
+        )
+        update_quant_cfg(
+            "*input_quantizer", {"num_bits": 8, "axis": None, "trt_high_precision_dtype": "Float"}
+        )
+        update_quant_cfg("*output_quantizer", {"enable": False, "trt_high_precision_dtype": "Float"})
+        # DFL is post-processing only; quantizing it hurts accuracy.
+        update_quant_cfg("*.dfl*weight_quantizer", {"enable": False})
+        update_quant_cfg("*.dfl*input_quantizer", {"enable": False})
+        update_quant_cfg("*.dfl*output_quantizer", {"enable": False})
+        if use_histogram:
+            # HistogramCalibrator only supports per-tensor (axis=None); keep weights on Max.
+            quant_cfg["*input_quantizer"]["calibrator"] = "histogram"
+        # User-supplied exclusions (e.g. detection head, attention blocks). Matches
+        # any module whose qualified name contains the pattern. Last-write-wins, so
+        # user patterns override the static defaults above on conflict.
+        user_exclude = getattr(self.args, "qat_exclude", None) or []
+        for pat in user_exclude:
+            for q in ("weight_quantizer", "input_quantizer", "output_quantizer"):
+                quant_cfg[f"*{pat}*{q}"] = {"enable": False}
+        if user_exclude:
+            LOGGER.info(f"{colorstr('QAT:')} Excluding patterns from Q/DQ: {user_exclude}")
+        # algorithm=None: skip modelopt's auto-calibrate; we run forward_loop ourselves
+        # below so we can call `load_calib_amax("percentile", percentile=...)` per
+        # quantizer (modelopt's mtq.calibrate doesn't expose percentile directly).
+        config = {"quant_cfg": quant_cfg, "algorithm": "max" if calib_method == "max" else None}
+
+        # DDP receives a global train batch; calibration runs per-rank (no autograd, so
+        # memory headroom is large). Cap per-rank calibration batch at 8 to keep amax
+        # statistics stable without OOM risk on smaller GPUs.
+        global_batch = int(self.args.batch) if int(self.args.batch) > 0 else 8
+        per_rank_batch = max(global_batch // max(self.world_size, 1), 1)
+        calib_batch = min(per_rank_batch, 8)
+        # Calibration data: use TRAIN images with VAL-mode preprocessing (no augmentation,
+        # just letterbox + rect batching). Two reasons:
+        #   1. Using val data would leak val statistics into the quantizer scales, biasing
+        #      the val mAP we use to judge QAT quality.
+        #   2. mode="val" disables mosaic/mixup/albumentations so calibration sees clean
+        #      inputs that match deployment-time preprocessing.
+        # ContiguousDistributedSampler (used by mode="val") keeps each batch shape-aligned
+        # under rect=True and gives each rank a disjoint slice; cross-rank MAX amax sync
+        # below restores full-range statistics. Override the source via `qat_calib_data:`
+        # in the QAT yaml (e.g. point at the same /mldata/quant/calibration-images-* dir
+        # used by quant/make_int8.py).
+        calib_data = getattr(self.args, "qat_calib_data", None) or self.data["train"]
+        calib_loader = self.get_dataloader(
+            calib_data, batch_size=calib_batch, rank=LOCAL_RANK, mode="val"
+        )
+        dataset_len = len(calib_loader.dataset)
+        if dataset_len < 1:
+            raise ValueError("QAT calibration requires at least one validation image.")
+        # Per-rank sample cap. Total samples seen across calibration = num_samples * world_size.
+        # Default 4096/rank → 32k for an 8-GPU run, matching the user's PTQ recipe. With "max"
+        # calibration plus the cross-rank MAX sync below, more samples = a tighter amax bound
+        # (monotonically non-decreasing). Override via `qat_calib_samples:` in the QAT yaml.
+        num_samples = int(getattr(self.args, "qat_calib_samples", 0) or 4096)
+        num_samples = min(num_samples, dataset_len)
+        LOGGER.info(
+            f"{colorstr('QAT:')} Calibrating method={calib_method}"
+            f"{f' (p={calib_percentile})' if calib_method == 'percentile' else ''} "
+            f"with batch={calib_batch} per rank "
+            f"(train batch={global_batch}, world_size={self.world_size}, "
+            f"samples/rank={num_samples}, total={num_samples * max(self.world_size, 1)})"
+        )
+
+        def forward_loop(model):
+            model.to(self.device)
+            model.eval()
+            count = 0
+            try:
+                with torch.inference_mode():
+                    for batch in calib_loader:
+                        if count >= num_samples:
+                            break
+                        images = self.preprocess_batch(batch)["img"]
+                        model(images)
+                        count += images.shape[0]
+            finally:
+                model.cpu()
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+            if count == 0:
+                raise RuntimeError("QAT calibration did not run any images; check validation data and batch size.")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            if calib_method == "max":
+                # modelopt's max_calibrate handles enable_stats / forward / load_amax.
+                self.model = mtq.quantize(model=self.model, config=config, forward_loop=forward_loop)
+            else:
+                # Manual two-step: insert Q/DQ (algorithm=None), then run our own
+                # histogram-based calibration with method-specific load_calib_amax.
+                self.model = mtq.quantize(model=self.model, config=config, forward_loop=None)
+                enable_stats_collection(self.model)
+                forward_loop(self.model)
+                load_kwargs: dict = {}
+                if calib_method == "percentile":
+                    load_kwargs["percentile"] = calib_percentile
+                missed: list[str] = []
+                for q_name, q_mod in self.model.named_modules():
+                    if not isinstance(q_mod, TensorQuantizer) or q_mod._disabled:
+                        continue
+                    cal = getattr(q_mod, "_calibrator", None)
+                    if cal is None or getattr(q_mod, "_dynamic", False):
+                        continue
+                    try:
+                        if isinstance(cal, HistogramCalibrator):
+                            q_mod.load_calib_amax(calib_method, strict=False, **load_kwargs)
+                        else:
+                            # MaxCalibrator (weight quantizers) — no method/kwargs.
+                            q_mod.load_calib_amax(strict=False)
+                    except Exception:
+                        missed.append(q_name)
+                    q_mod.enable_quant()
+                    q_mod.disable_calib()
+                if missed:
+                    LOGGER.warning(
+                        f"{colorstr('QAT:')} {len(missed)} quantizer(s) failed amax load "
+                        f"(no calibration data); first 5: {missed[:5]}"
+                    )
+
+        # DDP: each rank calibrated on its own data slice, so amax values diverge.
+        # All ranks must enter the same collectives in the same order. Some branches
+        # can be exercised on only a subset of ranks, so reduce a validity mask and a
+        # zero-filled amax tensor instead of skipping invalid local quantizers.
+        if self.world_size > 1 and dist.is_available() and dist.is_initialized():
+            synced = 0
+            for q_name, q_mod in self.model.named_modules():
+                amax = getattr(q_mod, "amax", None)
+                if amax is None or not torch.is_tensor(amax):
+                    continue
+                valid = torch.isfinite(amax).all() and (amax >= 0).all()
+                valid_count = torch.tensor(1 if valid else 0, device=self.device, dtype=torch.int32)
+                amax_sync = amax.to(self.device) if valid else torch.zeros_like(amax, device=self.device)
+                dist.all_reduce(valid_count, op=dist.ReduceOp.SUM)
+                dist.all_reduce(amax_sync, op=dist.ReduceOp.MAX)
+                if int(valid_count.item()) > 0:
+                    q_mod.amax.copy_(amax_sync.to(q_mod.amax.device))
+                    synced += 1
+            LOGGER.info(f"{colorstr('QAT:')} Synced amax across {self.world_size} ranks for {synced} quantizer(s)")
+
+        # Post-calibration: any quantizer that didn't see data has amax uninitialized
+        # (NaN or negative). modelopt's CUDA kernel asserts `amax >= 0` so the next
+        # forward pass crashes hard. This happens for conditional branches like
+        # `one2one_*` heads when end2end=False, attr heads in datasets without attrs,
+        # etc. Duck-type so we don't depend on a specific modelopt class path.
+        disabled: list[str] = []
+        for q_name, q_mod in self.model.named_modules():
+            if not (hasattr(q_mod, "amax") and hasattr(q_mod, "disable")):
+                continue
+            amax = getattr(q_mod, "amax", None)
+            invalid = amax is None or (
+                torch.is_tensor(amax) and (torch.isnan(amax).any() or (amax < 0).any())
+            )
+            if invalid:
+                q_mod.disable()
+                disabled.append(q_name)
+        if disabled:
+            LOGGER.warning(
+                f"{colorstr('QAT:')} Disabled {len(disabled)} unexercised quantizer(s) "
+                f"(no calibration data); first 5: {disabled[:5]}"
+            )
+
+        LOGGER.info(f"{colorstr('QAT:')} Inserted Q/DQ layers for QAT")
 
     def get_model(self, cfg=None, weights=None, verbose=True):
         """Get model and raise NotImplementedError for loading cfg files."""

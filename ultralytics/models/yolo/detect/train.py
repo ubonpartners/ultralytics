@@ -145,6 +145,8 @@ class DetectionTrainer(BaseTrainer):
         self.model.nc = self.data["nc"]  # attach number of classes to model
         self.model.names = self.data["names"]  # attach class names to model
         self.model.args = self.args  # attach hyperparameters to model
+        if hasattr(self.model, "end2end") and self.args.end2end is not None:
+            self.model.end2end = self.args.end2end
         # Attach attribute names when using an attribute head (saved with checkpoint for inference)
         attr_nc = getattr(unwrap_model(self.model), "yaml", {}).get("attr_nc", 0) or self.data.get("attr_nc", 0)
         if attr_nc:

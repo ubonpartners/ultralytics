@@ -494,6 +494,15 @@ class Exporter:
         self.im = im
         self.model = model
         self.file = file
+        # QAT: model carries `_modelopt_state` from the trainer round-trip. Detection is structural
+        # (no separate flag) so re-exporting a QAT checkpoint just works.
+        self.qat = (
+            hasattr(model, "_modelopt_state")
+            and isinstance(model._modelopt_state, (list, tuple))
+            and len(model._modelopt_state) > 0
+            and len(model._modelopt_state[0]) > 0
+            and model._modelopt_state[0][0] == "quantize"
+        )
         self.output_shape = (
             tuple(y.shape)
             if isinstance(y, torch.Tensor)
@@ -683,6 +692,11 @@ class Exporter:
         if self.args.nms and self.model.task == "obb":
             self.args.opset = opset  # for NMSModel
             self.args.simplify = True  # fix OBB runtime error related to topk
+        if self.qat:
+            # Q/DQ export goes through CPU: modelopt's tracing path crashes if the CUDA
+            # toolkit isn't available on the export host, even when CUDA runtime is.
+            self.model.cpu()
+            self.im = self.im.cpu()
 
         with arange_patch(dynamic=bool(dynamic), half=self.args.half, fmt=self.args.format):
             torch2onnx(
@@ -956,7 +970,9 @@ class Exporter:
             self.args.dynamic,
             self.im.shape,
             dla=self.dla,
-            dataset=self.get_int8_calibration_dataloader(prefix) if self.args.int8 else None,
+            # QAT ONNX already carries explicit Q/DQ scales; PTQ calibration is unnecessary
+            # (and breaks because the calibrator algo conflicts with explicit quantization).
+            dataset=self.get_int8_calibration_dataloader(prefix) if self.args.int8 and not self.qat else None,
             metadata=self.metadata,
             verbose=self.args.verbose,
             prefix=prefix,

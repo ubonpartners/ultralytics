@@ -1323,12 +1323,16 @@ class E2ELoss:
             self.one2one.flow_model = copy.deepcopy(self.one2many.flow_model)
         self.updates = 0
         self.total = 1.0
-        # init gain
-        self.o2m = 0.8
-        self.o2o = self.total - self.o2m
-        self.o2m_copy = self.o2m
         # final gain
         self.final_o2m = 0.1
+        # init gain — QAT fine-tunes a model that already finished the o2m→final_o2m
+        # decay, so pin both copies at final_o2m to skip the warmup.
+        if getattr(model.args, "int8", False):
+            self.o2m = self.final_o2m
+        else:
+            self.o2m = 0.8
+        self.o2o = self.total - self.o2m
+        self.o2m_copy = self.o2m
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""

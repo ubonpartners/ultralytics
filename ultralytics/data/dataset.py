@@ -183,7 +183,8 @@ class YOLODataset(BaseDataset):
             (list[dict]): List of label dictionaries, each containing information about an image and its annotations.
         """
         self.label_files = img2label_paths(self.im_files)
-        cache_path = Path(self.label_files[0]).parent.with_suffix(".cache")
+        cache_suffix = f".subsample{self.sample_stride}.cache" if self.sample_stride > 1 else ".cache"
+        cache_path = Path(self.label_files[0]).parent.with_suffix(cache_suffix)
         base_hash = get_hash(self.label_files + self.im_files)
         expected_hash = f"{base_hash}.attr_{int(self.attributes)}_{self.attr_nc}_{self.attr_label_format}"
         try:
